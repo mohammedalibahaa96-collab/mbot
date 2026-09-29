@@ -10,7 +10,9 @@ export type Candle = {
 
 export type MarketDirection = 'up' | 'down' | 'neutral'
 export type SignalKind = 'bull' | 'bear' | 'neutral'
-export type EntryStrategy = 'confluence' | 'sweep' | 'structure' | 'orderBlock' | 'fvgRetest' | 'trend'
+export type EntryStrategy = 'confluence' | 'sweep' | 'structure' | 'orderBlock' | 'fvgRetest' | 'trend' | 'scalp'
+export type ScalpCheckStatus = 'pass' | 'wait' | 'warmup'
+export type ScalpCheck = { label: string; status: ScalpCheckStatus }
 
 export type MarketSignals = {
   trend: MarketDirection
@@ -23,6 +25,10 @@ export type MarketSignals = {
   orderBlock: SignalKind
   fvg: SignalKind
   fvgRetest: SignalKind
+  rsi: number | null
+  atr: number | null
+  volumeRatio: number | null
+  scalpChecks: ScalpCheck[]
   labels: string[]
   autoSide: 'long' | 'short' | null
 }
@@ -77,6 +83,64 @@ function countSide(features: SignalKind[], side: 'bull' | 'bear') {
   return features.filter((feature) => feature === side).length
 }
 
+export function calculateRsi(values: number[], period = 14): number | null {
+  if (values.length < period + 1) return null
+  let gains = 0
+  let losses = 0
+  for (let index = values.length - period; index < values.length; index += 1) {
+    const change = values[index] - values[index - 1]
+    if (change > 0) gains += change
+    else losses -= change
+  }
+  const averageGain = gains / period
+  const averageLoss = losses / period
+  if (averageLoss === 0) return averageGain === 0 ? 50 : 100
+  const relativeStrength = averageGain / averageLoss
+  return 100 - 100 / (1 + relativeStrength)
+}
+
+export function calculateAtr(candles: Candle[], period = 14): number | null {
+  if (candles.length < period + 1) return null
+  const ranges: number[] = []
+  for (let index = candles.length - period; index < candles.length; index += 1) {
+    const current = candles[index]
+    const previous = candles[index - 1]
+    if (!current || !previous) continue
+    ranges.push(Math.max(current.high - current.low, Math.abs(current.high - previous.close), Math.abs(current.low - previous.close)))
+  }
+  return ranges.length === period ? ranges.reduce((sum, range) => sum + range, 0) / period : null
+}
+
+function decimalPlaces(value: number): number {
+  const [coefficient, exponentText] = value.toString().toLowerCase().split('e')
+  const exponent = Number(exponentText || 0)
+  const decimals = (coefficient?.split('.')[1] || '').length - exponent
+  return Math.max(0, Math.min(12, decimals))
+}
+
+/** Round simulated base quantity down to a Binance lot-size step. */
+export function floorQuantityToStep(quantity: number, stepSize: number): number {
+  if (!Number.isFinite(quantity) || quantity <= 0) return 0
+  if (!Number.isFinite(stepSize) || stepSize <= 0) return quantity
+  const precision = decimalPlaces(stepSize)
+  return Number((Math.floor((quantity + stepSize * 1e-10) / stepSize) * stepSize).toFixed(precision))
+}
+
+/** Position notional whose configured stop distance corresponds to the requested equity risk. */
+export function calculateRiskSizedNotional(equity: number, riskPct: number, stopDistancePct: number): number {
+  if (!Number.isFinite(equity) || !Number.isFinite(riskPct) || !Number.isFinite(stopDistancePct) || equity <= 0 || riskPct <= 0 || stopDistancePct <= 0) return 0
+  return (equity * riskPct / 100) / (stopDistancePct / 100)
+}
+
+export function getAtrExitPrices(entryPrice: number, side: 'long' | 'short', atr: number, stopAtr: number, targetAtr: number) {
+  const stopDistance = atr * stopAtr
+  const targetDistance = atr * targetAtr
+  return {
+    stopLoss: side === 'long' ? entryPrice - stopDistance : entryPrice + stopDistance,
+    takeProfit: side === 'long' ? entryPrice + targetDistance : entryPrice - targetDistance,
+  }
+}
+
 /**
  * Lightweight, closed-candle SMC heuristics for chart context and paper entries.
  * These are not validated institutional order-flow rules or a price predictor.
@@ -110,6 +174,58 @@ export function calculateSignals(oneMinute: Candle[], fifteenMinute: Candle[], s
   let fvg: SignalKind = 'neutral'
   let fvgRetest: SignalKind = 'neutral'
   const labels: string[] = []
+  const closes1m = closed1m.map((bar) => bar.close)
+  const rsi = calculateRsi(closes1m)
+  const atr = calculateAtr(closed1m)
+  const ema9 = calculateEma(closes1m, 9)
+  const ema21 = calculateEma(closes1m, 21)
+  const previous1m = closed1m.at(-2)
+  const previousEma9 = ema9.at(-2)
+  const currentEma9 = ema9.at(-1)
+  const currentEma21 = ema21.at(-1)
+  const previousVolumes = closed1m.slice(-21, -1)
+  const averageVolume = previousVolumes.length === 20 ? previousVolumes.reduce((sum, bar) => sum + bar.volume, 0) / 20 : 0
+  const volumeRatio = current && averageVolume > 0 ? current.volume / averageVolume : null
+  const hasOneMinuteHistory = closed1m.length >= 30
+  const hasEmaData = currentEma9 !== undefined && previousEma9 !== undefined && currentEma21 !== undefined
+  const scalpDirection: 'long' | 'short' | null = trend === 'up' ? 'long' : trend === 'down' ? 'short' : null
+  const atrPercent = current && atr !== null && atr > 0 && current.close > 0 ? atr / current.close : null
+  const candleRange = current ? current.high - current.low : null
+  const bodyStrength = current && candleRange !== null && candleRange > 0 ? (current.close - current.open) / candleRange : null
+  const extension = current && currentEma9 !== undefined && atr !== null && atr > 0 ? Math.abs(current.close - currentEma9) / atr : null
+  const trendContextReady = scalpDirection !== null && confirmations >= 1
+  const emaAligned = scalpDirection === 'long'
+    ? currentEma9 !== undefined && currentEma21 !== undefined && previousEma9 !== undefined && currentEma9 > currentEma21 && currentEma9 >= previousEma9
+    : scalpDirection === 'short'
+      ? currentEma9 !== undefined && currentEma21 !== undefined && previousEma9 !== undefined && currentEma9 < currentEma21 && currentEma9 <= previousEma9
+      : false
+  const pullbackAndReclaim = scalpDirection === 'long'
+    ? Boolean(current && previous1m && previousEma9 !== undefined && currentEma9 !== undefined && atr !== null && previous1m.close <= previousEma9 + atr * 0.15 && current.close > currentEma9)
+    : scalpDirection === 'short'
+      ? Boolean(current && previous1m && previousEma9 !== undefined && currentEma9 !== undefined && atr !== null && previous1m.close >= previousEma9 - atr * 0.15 && current.close < currentEma9)
+      : false
+  const rsiInRange = rsi !== null && (scalpDirection === 'long' ? rsi >= 50 && rsi <= 68 : scalpDirection === 'short' ? rsi >= 32 && rsi <= 50 : false)
+  const atrInRange = atrPercent !== null && atrPercent >= 0.00012 && atrPercent <= 0.015
+  const volumeConfirmed = volumeRatio !== null && volumeRatio >= 1.05
+  const candleConfirmed = bodyStrength !== null && (scalpDirection === 'long' ? bodyStrength >= 0.45 : scalpDirection === 'short' ? bodyStrength <= -0.45 : false)
+  const extensionWithinLimit = extension !== null && extension <= 0.8
+  const statusFor = (hasData: boolean, passed: boolean): ScalpCheckStatus => !hasData ? 'warmup' : passed ? 'pass' : 'wait'
+  const scalpChecks: ScalpCheck[] = [
+    { label: `Closed 1m candles (${closed1m.length}/30)`, status: hasOneMinuteHistory ? 'pass' : 'warmup' },
+    { label: '15m bias + candle confirmation', status: closed15m.length < 20 ? 'warmup' : statusFor(true, trendContextReady) },
+    { label: 'EMA 9/21 alignment', status: statusFor(hasEmaData, emaAligned) },
+    { label: 'RSI band', status: statusFor(rsi !== null, rsiInRange) },
+    { label: 'ATR volatility band', status: statusFor(atrPercent !== null, atrInRange) },
+    { label: 'Volume ≥ 1.05× average', status: statusFor(volumeRatio !== null, volumeConfirmed) },
+    { label: 'Pullback and EMA reclaim', status: statusFor(Boolean(current && previous1m && hasEmaData && atr !== null), pullbackAndReclaim) },
+    { label: 'Candle strength + ≤ 0.8 ATR extension', status: statusFor(bodyStrength !== null && extension !== null, candleConfirmed && extensionWithinLimit) },
+  ]
+  const indicatorsReady = Boolean(current && previous1m && atr !== null && atr > 0 && rsi !== null && volumeRatio !== null && hasEmaData)
+  let scalpSide: 'long' | 'short' | null = null
+  if (hasOneMinuteHistory && indicatorsReady && trendContextReady && emaAligned && rsiInRange && atrInRange && volumeConfirmed && pullbackAndReclaim && candleConfirmed && extensionWithinLimit) {
+    scalpSide = scalpDirection
+    labels.push(`Scalp ${scalpSide!.toUpperCase()} · RSI ${rsi!.toFixed(0)} · ATR ${(atrPercent! * 100).toFixed(2)}% · VOL ${volumeRatio!.toFixed(2)}×`)
+  }
 
   if (current && prior.length >= 8) {
     const structure = prior.slice(-8)
@@ -219,9 +335,11 @@ export function calculateSignals(oneMinute: Candle[], fifteenMinute: Candle[], s
   } else if (strategy === 'trend') {
     if (trend === 'up' && confirmations === 2) autoSide = 'long'
     if (trend === 'down' && confirmations === 2) autoSide = 'short'
+  } else if (strategy === 'scalp') {
+    autoSide = scalpSide
   }
 
-  return { trend, confirmations, smc, bullCount, bearCount, bos, sweep, orderBlock, fvg, fvgRetest, labels, autoSide }
+  return { trend, confirmations, smc, bullCount, bearCount, bos, sweep, orderBlock, fvg, fvgRetest, rsi, atr, volumeRatio, scalpChecks, labels, autoSide }
 }
 
 function getClosedCandles(candles: Candle[]) {

@@ -7,7 +7,7 @@ const source = await readFile(new URL('../src/lib/market.ts', import.meta.url), 
 const javascript = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
-const { calculateSignals, detectTrianglePattern, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`)
+const { calculateAtr, calculateRiskSizedNotional, calculateRsi, calculateSignals, detectTrianglePattern, floorQuantityToStep, getAtrExitPrices, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`)
 
 function risingFifteenMinuteBars() {
   return Array.from({ length: 32 }, (_, index) => ({
@@ -31,6 +31,46 @@ function flatOneMinuteBars(length = 25) {
   }))
 }
 
+function scalpLongBars() {
+  const length = 40
+  const closes = Array.from({ length }, (_, index) => 100 + 0.01 * index + 0.1 * Math.sin(index * 0.85))
+  closes[length - 3] -= 0.16
+  closes[length - 2] -= 0.22
+  closes[length - 1] = 100.33
+  return closes.map((close, index) => {
+    const previous = closes[Math.max(0, index - 1)]
+    const open = index === length - 1 ? closes[index - 1] - 0.02 : (previous + close) / 2
+    return {
+      time: index * 60,
+      open,
+      high: Math.max(open, close) + 0.02,
+      low: Math.min(open, close) - 0.02,
+      close,
+      volume: index === length - 1 ? 16 : 10,
+    }
+  })
+}
+
+function scalpShortBars() {
+  return scalpLongBars().map((bar) => ({
+    ...bar,
+    open: 202 - bar.open,
+    high: 202 - bar.low,
+    low: 202 - bar.high,
+    close: 202 - bar.close,
+  }))
+}
+
+function fallingFifteenMinuteBars() {
+  return risingFifteenMinuteBars().map((bar) => ({
+    ...bar,
+    open: 202 - bar.open,
+    high: 202 - bar.low,
+    low: 202 - bar.high,
+    close: 202 - bar.close,
+  }))
+}
+
 function triangleBars(kind) {
   const bars = Array.from({ length: 40 }, (_, index) => ({
     time: index * 60,
@@ -46,6 +86,62 @@ function triangleBars(kind) {
 }
 
 const risingBars = risingFifteenMinuteBars()
+
+test('RSI and ATR helpers calculate bounded rolling indicators', () => {
+  assert.equal(calculateRsi([1, 2, 3, 2, 4], 3), 75)
+  assert.equal(calculateRsi([1, 1, 1, 1], 3), 50)
+  assert.equal(calculateRsi([1, 2, 3], 3), null)
+  const candles = [
+    { time: 0, open: 10, high: 12, low: 8, close: 10, volume: 1 },
+    { time: 1, open: 10, high: 15, low: 11, close: 13, volume: 1 },
+    { time: 2, open: 13, high: 14, low: 10, close: 11, volume: 1 },
+  ]
+  assert.equal(calculateAtr(candles, 2), 4.5)
+  assert.equal(calculateAtr(candles.slice(0, 2), 2), null)
+})
+
+test('scalp signal requires closed-candle EMA/RSI/ATR/volume filters plus 15m context', () => {
+  const long = calculateSignals(scalpLongBars(), risingBars, 'scalp')
+  assert.equal(long.autoSide, 'long')
+  assert.ok(long.rsi >= 50 && long.rsi <= 68)
+  assert.ok(long.atr > 0)
+  assert.ok(long.volumeRatio >= 1.05)
+  assert.ok(long.scalpChecks.every((check) => check.status === 'pass'))
+
+  const short = calculateSignals(scalpShortBars(), fallingFifteenMinuteBars(), 'scalp')
+  assert.equal(short.autoSide, 'short')
+  assert.ok(short.rsi >= 32 && short.rsi <= 50)
+  assert.ok(short.scalpChecks.every((check) => check.status === 'pass'))
+})
+
+test('scalp readiness reports warmup and volume blockers instead of forcing an entry', () => {
+  const warmingUp = calculateSignals(flatOneMinuteBars(), risingBars, 'scalp')
+  assert.equal(warmingUp.autoSide, null)
+  assert.equal(warmingUp.scalpChecks[0].status, 'warmup')
+
+  const lowVolumeBars = scalpLongBars()
+  lowVolumeBars.at(-1).volume = 10
+  const lowVolume = calculateSignals(lowVolumeBars, risingBars, 'scalp')
+  assert.equal(lowVolume.autoSide, null)
+  assert.equal(lowVolume.scalpChecks.find((check) => check.label.startsWith('Volume'))?.status, 'wait')
+
+  const unfinished = scalpLongBars()
+  unfinished.at(-1).closeTime = Date.now() + 60_000
+  assert.equal(calculateSignals(unfinished, risingBars, 'scalp').autoSide, null)
+})
+
+test('ATR exits mirror correctly for long and short paper positions; sizing respects stop distance and lot steps', () => {
+  assert.deepEqual(getAtrExitPrices(100, 'long', 2, 1.2, 1.8), { stopLoss: 97.6, takeProfit: 103.6 })
+  assert.deepEqual(getAtrExitPrices(100, 'short', 2, 1.2, 1.8), { stopLoss: 102.4, takeProfit: 96.4 })
+  assert.equal(calculateRiskSizedNotional(1000, 0.5, 1), 500)
+  assert.equal(calculateRiskSizedNotional(1000, 0.5, 0), 0)
+  assert.equal(calculateRiskSizedNotional(1000, 0.5, -1), 0)
+  assert.equal(calculateRiskSizedNotional(0, 0.5, 1), 0)
+  assert.equal(floorQuantityToStep(1.239, 0.01), 1.23)
+  assert.equal(floorQuantityToStep(1.239, 1), 1)
+  assert.equal(floorQuantityToStep(1.239, 0), 1.239)
+  assert.equal(floorQuantityToStep(1.239, 1e-8), 1.239)
+})
 
 test('trend strategy waits for two aligned 15m candle confirmations', () => {
   const signals = calculateSignals(flatOneMinuteBars(), risingBars, 'trend')

@@ -47,7 +47,7 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { calculateEma, calculateSignals, detectTrianglePattern, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS, type Candle, type ChartLayer, type ChartLayerVisibility, type ChartMarker, type EntryStrategy, type MarketSignals, type TrianglePattern } from './lib/market'
+import { calculateEma, calculateRiskSizedNotional, calculateSignals, detectTrianglePattern, floorQuantityToStep, getAtrExitPrices, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS, type Candle, type ChartLayer, type ChartLayerVisibility, type ChartMarker, type EntryStrategy, type MarketSignals, type TrianglePattern } from './lib/market'
 
 type TradingMode = 'paper' | 'testnet' | 'live'
 type MarketType = 'spot' | 'futures'
@@ -93,6 +93,8 @@ type Settings = {
   leverage: number
   tradeIntervalValue: number
   tradeIntervalUnit: TradeIntervalUnit
+  scalpStopAtr: number
+  scalpTargetAtr: number
 }
 
 type ClosedTrade = {
@@ -206,6 +208,7 @@ const ENTRY_STRATEGY_LABELS: Record<EntryStrategy, string> = {
   orderBlock: 'Order-block retest',
   fvgRetest: 'FVG retest',
   trend: '15m trend confirmation',
+  scalp: 'Filtered momentum scalp',
 }
 const DEFAULT_SETTINGS: Settings = {
   entryStrategy: 'confluence',
@@ -223,6 +226,8 @@ const DEFAULT_SETTINGS: Settings = {
   leverage: 1,
   tradeIntervalValue: 1,
   tradeIntervalUnit: 'minutes',
+  scalpStopAtr: 1.2,
+  scalpTargetAtr: 1.8,
 }
 const PAPER_STORAGE_KEY = 'mbot-paper-account-v1'
 const TESTNET_ORDERS_STORAGE_KEY = 'mbot-testnet-orders-v1'
@@ -240,7 +245,7 @@ function clampNumber(value: unknown, minimum: number, maximum: number, fallback:
 function normalizeSettings(value: Partial<Settings> = {}): Settings {
   const merged = { ...DEFAULT_SETTINGS, ...value }
   const legacyStrategy = (value as Partial<Settings> & { strategy?: string }).strategy
-  const entryStrategies: EntryStrategy[] = ['confluence', 'sweep', 'structure', 'orderBlock', 'fvgRetest', 'trend']
+  const entryStrategies: EntryStrategy[] = ['confluence', 'sweep', 'structure', 'orderBlock', 'fvgRetest', 'trend', 'scalp']
   const sizingStrategies: SizingStrategy[] = ['fixed', 'martingale', 'anti']
   const rawEntryStrategy = (value as Partial<Settings>).entryStrategy
   const rawSizingStrategy = (value as Partial<Settings>).sizingStrategy
@@ -260,6 +265,8 @@ function normalizeSettings(value: Partial<Settings> = {}): Settings {
     leverage: Math.round(clampNumber(merged.leverage, 1, 3, DEFAULT_SETTINGS.leverage)),
     tradeIntervalValue: Math.round(clampNumber(merged.tradeIntervalValue, 1, 60, DEFAULT_SETTINGS.tradeIntervalValue)),
     tradeIntervalUnit: merged.tradeIntervalUnit === 'seconds' ? 'seconds' : 'minutes',
+    scalpStopAtr: clampNumber(merged.scalpStopAtr, 0.5, 3, DEFAULT_SETTINGS.scalpStopAtr),
+    scalpTargetAtr: Math.max(clampNumber(merged.scalpTargetAtr, 0.6, 5, DEFAULT_SETTINGS.scalpTargetAtr), clampNumber(merged.scalpStopAtr, 0.5, 3, DEFAULT_SETTINGS.scalpStopAtr) + 0.1),
   }
 }
 
@@ -1042,9 +1049,9 @@ function App() {
     else if (hitTarget) closePosition(currentPosition, price, 'Take profit')
   }, [price, currentPosition, closePosition])
 
-  const autoOrderSize = useCallback(() => {
+  const autoOrderSize = useCallback((stopDistancePct = settings.slPct) => {
     const equity = Math.max(0, paperEquity)
-    const riskSizedNotional = settings.slPct > 0 ? (equity * settings.riskPct / 100) / (settings.slPct / 100) : settings.baseOrder
+    const riskSizedNotional = calculateRiskSizedNotional(equity, settings.riskPct, stopDistancePct)
     const streakNow = getStreak(paper.history)
     let requested = Math.min(settings.baseOrder, riskSizedNotional)
     if (settings.sizingStrategy === 'martingale') requested = settings.baseOrder * Math.pow(settings.multiplier, streakNow.losses)
@@ -1074,22 +1081,26 @@ function App() {
       setToast('Safety lock reached. The paper bot has been paused.')
       return
     }
+    const leverage = marketType === 'futures' ? Math.min(Math.max(settings.leverage, 1), 3) : 1
     const requested = customSize ?? orderSize
-    const notional = Math.min(requested, settings.maxOrder, paper.cash * (marketType === 'futures' ? settings.leverage : 1) * 0.98)
-    if (notional < minNotional) {
-      setToast(`Order is below this symbol's current minimum notional (${formatMoney(minNotional)}).`)
+    const requestedNotional = Math.min(requested, settings.maxOrder, paper.cash * leverage * 0.98)
+    const maxQuantity = rules?.maxQty && rules.maxQty > 0 ? Math.min(requestedNotional / price, rules.maxQty) : requestedNotional / price
+    const quantity = floorQuantityToStep(maxQuantity, rules?.stepSize || 0)
+    const notional = quantity * price
+    if (notional < minNotional || quantity < (rules?.minQty || 0)) {
+      setToast(`Rounded paper order is below this symbol's minimum notional (${formatMoney(minNotional)}) or quantity.`)
       return
     }
-    const leverage = marketType === 'futures' ? Math.min(Math.max(settings.leverage, 1), 3) : 1
     const margin = marketType === 'futures' ? notional / leverage : notional
     const openFee = notional * FEE_RATE
     if (margin + openFee > paper.cash) {
       setToast('Insufficient demo balance for this size and estimated fee.')
       return
     }
-    const quantity = notional / price
-    const stopLoss = side === 'long' ? price * (1 - settings.slPct / 100) : price * (1 + settings.slPct / 100)
-    const takeProfit = side === 'long' ? price * (1 + settings.tpPct / 100) : price * (1 - settings.tpPct / 100)
+    const scalpBotTrade = source === 'bot' && settings.entryStrategy === 'scalp' && signals.atr !== null && signals.atr > 0
+    const atrExits = scalpBotTrade ? getAtrExitPrices(price, side, signals.atr!, settings.scalpStopAtr, settings.scalpTargetAtr) : null
+    const stopLoss = atrExits?.stopLoss ?? (side === 'long' ? price * (1 - settings.slPct / 100) : price * (1 + settings.slPct / 100))
+    const takeProfit = atrExits?.takeProfit ?? (side === 'long' ? price * (1 + settings.tpPct / 100) : price * (1 - settings.tpPct / 100))
     const position: OpenPosition = {
       id: `paper-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       symbol,
@@ -1107,13 +1118,14 @@ function App() {
       source,
     }
     setPaper((current) => ({ ...current, cash: current.cash - margin - openFee, position }))
-    logEvent(source === 'bot' ? 'BOT' : 'PAPER', 'success', `${side.toUpperCase()} ${symbol} opened · ${formatMoney(notional)} notional at ${formatPrice(price)}.`)
-    setToast(`${source === 'bot' ? 'Paper bot' : 'Manual paper'} ${side} opened · ${formatMoney(notional)} notional`)
+    const exitPlanLabel = scalpBotTrade ? ` · ATR SL ${settings.scalpStopAtr.toFixed(1)}× / TP ${settings.scalpTargetAtr.toFixed(1)}×` : ''
+    logEvent(source === 'bot' ? 'BOT' : 'PAPER', 'success', `${side.toUpperCase()} ${symbol} opened · ${formatMoney(notional)} notional at ${formatPrice(price)}${exitPlanLabel}.`)
+    setToast(`${source === 'bot' ? 'Paper bot' : 'Manual paper'} ${side} opened · ${formatMoney(notional)} notional${scalpBotTrade ? ' · ATR exits' : ''}`)
     if (alertOn && typeof window !== 'undefined') {
       playTradeTone('open')
       try { window.dispatchEvent(new CustomEvent('mbot-trade-open', { detail: { side, symbol } })) } catch { /* ignore */ }
     }
-  }, [marketMode, marketSourceReady, price, paper.position, paper.cash, marketType, dailyLocked, streak.losses, settings, closedToday, orderSize, minNotional, symbol, timeframe, alertOn, playTradeTone, logEvent])
+  }, [marketMode, marketSourceReady, price, paper.position, paper.cash, marketType, dailyLocked, streak.losses, settings, closedToday, orderSize, minNotional, symbol, timeframe, signals, alertOn, playTradeTone, logEvent])
 
   useEffect(() => {
     if (!isRunning || marketMode !== 'paper') return
@@ -1124,13 +1136,16 @@ function App() {
       setToast(`${reason} Bot paused for safety.`)
       return
     }
-    if (paper.position || cooldownRemainingMs > 0 || !signals.autoSide || !oneMinuteBars.length) return
+    if (!marketSourceReady || !price || paper.position || cooldownRemainingMs > 0 || !signals.autoSide || !oneMinuteBars.length) return
     const closed = oneMinuteBars.filter((bar) => !bar.closeTime || bar.closeTime < Date.now()).at(-1)
     if (!closed || closed.time === autoTradeCandleRef.current) return
     if (marketType === 'spot' && signals.autoSide === 'short') return
     autoTradeCandleRef.current = closed.time
-    openPaperPosition(signals.autoSide, 'bot', autoOrderSize())
-  }, [isRunning, marketMode, dailyLocked, streak.losses, settings.maxLosses, settings.maxTrades, closedToday, paper.position, signals, oneMinuteBars, marketType, openPaperPosition, autoOrderSize, cooldownRemainingMs, logEvent])
+    const stopDistancePct = settings.entryStrategy === 'scalp' && signals.atr !== null && signals.atr > 0 && price > 0
+      ? (signals.atr * settings.scalpStopAtr / price) * 100
+      : settings.slPct
+    openPaperPosition(signals.autoSide, 'bot', autoOrderSize(stopDistancePct))
+  }, [isRunning, marketMode, marketSourceReady, dailyLocked, streak.losses, settings.maxLosses, settings.maxTrades, settings.entryStrategy, settings.scalpStopAtr, settings.slPct, closedToday, paper.position, signals, oneMinuteBars, marketType, price, openPaperPosition, autoOrderSize, cooldownRemainingMs, logEvent])
 
   useEffect(() => {
     if (!toast) return
@@ -1268,7 +1283,12 @@ function App() {
   const primaryUsdt = marketMode === 'paper' ? paper.cash : (account?.balances.find((asset) => asset.asset === 'USDT')?.free || 0)
   const accountTitle = marketMode === 'paper' ? 'Paper wallet' : marketMode === 'testnet' ? 'Testnet account' : 'Live account'
   const marketStatus = marketSourceReady ? 'online' : marketError ? 'warning' : 'connecting'
-  const signalDescription = signals.autoSide ? `${ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · ${signals.autoSide.toUpperCase()}` : signals.smc === 'bull' ? 'Bullish structure' : signals.smc === 'bear' ? 'Bearish structure' : 'No confluence'
+  const signalExecutable = Boolean(signals.autoSide && !(marketType === 'spot' && signals.autoSide === 'short'))
+  const botEntryReady = marketMode === 'paper' && isRunning && marketSourceReady && signalExecutable && !dailyLocked && streak.losses < settings.maxLosses && closedToday < settings.maxTrades && !paper.position && cooldownRemainingMs <= 0
+  const signalDescription = signals.autoSide ? `${ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · ${signals.autoSide.toUpperCase()}${marketType === 'spot' && signals.autoSide === 'short' ? ' · SPOT SHORT BLOCKED' : ''}` : settings.entryStrategy === 'scalp' ? 'Waiting for scalp filters' : signals.smc === 'bull' ? 'Bullish structure' : signals.smc === 'bear' ? 'Bearish structure' : 'No confluence'
+  const signalListLabels = settings.entryStrategy === 'scalp' && !signals.autoSide
+    ? ['No scalp entry yet · review the readiness checks above']
+    : signals.labels.length ? signals.labels.slice(0, 3) : [signals.autoSide ? `${ENTRY_STRATEGY_LABELS[settings.entryStrategy]} conditions aligned` : 'Waiting for the selected strategy signal']
   const riskCap = Math.min(settings.maxOrder, Math.max(0, paper.cash))
   const testnetCap = config?.testnetOrderCapUsdt || 25
   const canTestnetTrade = marketMode === 'testnet' && marketType === 'spot' && Boolean(config?.testnetOrdersEnabled && config.testnetAccountConfigured && config.accountAccessConfigured)
@@ -1498,7 +1518,15 @@ function App() {
                     <option value="orderBlock">Order-block retest</option>
                     <option value="fvgRetest">Fair-value-gap retest</option>
                     <option value="trend">15m trend · 2 confirmations</option>
+                    <option value="scalp">Filtered 1m scalp · EMA/RSI/volume</option>
                   </select><ChevronDown size={13} /></div>
+                  {settings.entryStrategy === 'scalp' && <>
+                    <div className="two-field-row compact-row scalp-config-row">
+                      <div><label htmlFor="scalp-stop-atr">Bot stop distance</label><div className="mini-input"><input id="scalp-stop-atr" type="number" min="0.5" max="3" step="0.1" value={settings.scalpStopAtr} onChange={(event) => updateSettings({ scalpStopAtr: Math.min(3, Math.max(0.5, Number(event.target.value))) })} /><span>ATR</span></div></div>
+                      <div><label htmlFor="scalp-target-atr">Bot target distance</label><div className="mini-input"><input id="scalp-target-atr" type="number" min="0.6" max="5" step="0.1" value={settings.scalpTargetAtr} onChange={(event) => updateSettings({ scalpTargetAtr: Math.max(settings.scalpStopAtr + 0.1, Math.min(5, Number(event.target.value))) })} /><span>ATR</span></div></div>
+                    </div>
+                    <div className="interval-hint"><Info size={11} /> Closed 1m EMA 9/21 reclaim, 15m bias, RSI, volume and ATR filters. ATR exits and risk sizing apply to Paper bot entries only; manual orders use the percentage stops below.</div>
+                  </>}
                   <div className="field-label-row sizing-label-row"><label htmlFor="sizing-strategy">Position sizing</label><span>Demo only</span></div>
                   <div className="select-wrap"><select id="sizing-strategy" value={settings.sizingStrategy} onChange={(event) => updateSettings({ sizingStrategy: event.target.value as SizingStrategy })}>
                     <option value="fixed">Fixed risk-sized</option><option value="martingale">Martingale · capped demo</option><option value="anti">Anti-martingale · capped demo</option>
@@ -1512,8 +1540,8 @@ function App() {
                     <div><label htmlFor="max-losses">Loss stop</label><div className="mini-input"><input id="max-losses" type="number" min="1" max="7" value={settings.maxLosses} onChange={(event) => updateSettings({ maxLosses: Math.min(7, Math.max(1, Number(event.target.value))) })} /><span>losses</span></div></div>
                   </div>}
                   <div className="two-field-row">
-                    <div><label htmlFor="stop-loss">Stop loss</label><div className="mini-input"><input id="stop-loss" type="number" min="0.1" max="20" step="0.1" value={settings.slPct} onChange={(event) => updateSettings({ slPct: Math.max(0.1, Number(event.target.value)) })} /><span>%</span></div></div>
-                    <div><label htmlFor="take-profit">Take profit</label><div className="mini-input"><input id="take-profit" type="number" min="0.1" max="50" step="0.1" value={settings.tpPct} onChange={(event) => updateSettings({ tpPct: Math.max(0.1, Number(event.target.value)) })} /><span>%</span></div></div>
+                    <div><label htmlFor="stop-loss">{settings.entryStrategy === 'scalp' ? 'Manual stop loss' : 'Stop loss'}</label><div className="mini-input"><input id="stop-loss" type="number" min="0.1" max="20" step="0.1" value={settings.slPct} onChange={(event) => updateSettings({ slPct: Math.max(0.1, Number(event.target.value)) })} /><span>%</span></div></div>
+                    <div><label htmlFor="take-profit">{settings.entryStrategy === 'scalp' ? 'Manual take profit' : 'Take profit'}</label><div className="mini-input"><input id="take-profit" type="number" min="0.1" max="50" step="0.1" value={settings.tpPct} onChange={(event) => updateSettings({ tpPct: Math.max(0.1, Number(event.target.value)) })} /><span>%</span></div></div>
                   </div>
                   {marketType === 'futures' && <div className="two-field-row compact-row">
                     <div><label htmlFor="leverage">Paper leverage</label><div className="mini-input"><input id="leverage" type="number" min="1" max="3" step="1" value={settings.leverage} onChange={(event) => updateSettings({ leverage: Math.min(3, Math.max(1, Number(event.target.value))) })} /><span>×</span></div></div>
@@ -1555,7 +1583,7 @@ function App() {
                   <div className="guardrail-note"><ShieldCheck size={13} /><span>Hard caps: multiplier ≤3×, leverage ≤3× in paper, loss stop ≤7. Live execution is off.</span></div>
                   <div className="strategy-footer-stats">
                     <div><span>15m BIAS</span><strong className={signals.trend === 'up' ? 'value-positive' : signals.trend === 'down' ? 'value-negative' : ''}>{signals.trend.toUpperCase()}</strong></div>
-                    <div><span>CONFIRM</span><strong>{signals.confirmations}/2</strong></div>
+                    <div><span>CONFIRM</span><strong>{signals.confirmations}{settings.entryStrategy === 'scalp' ? ' · 1+ min' : '/2'}</strong></div>
                     <div><span>LOSS RUN</span><strong className={streak.losses ? 'value-negative' : ''}>{streak.losses}/{settings.maxLosses}</strong></div>
                   </div>
                 </div>
@@ -1563,7 +1591,17 @@ function App() {
 
               <section className="panel structure-panel">
                 <div className="panel-heading structure-heading"><div><div className="panel-kicker">MARKET STRUCTURE</div><h2>Signal monitor</h2></div><span className="heuristic-tag">HEURISTIC</span></div>
-                <div className="signal-summary"><div className={`signal-icon ${signals.smc}`}><Activity size={17} /></div><div><strong>{signalDescription}</strong><span>{ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · 15m bias {signals.trend} · {signals.confirmations}/2 confirmations</span></div><div className={`signal-pip ${signals.smc}`} /></div>
+                <div className="signal-summary"><div className={`signal-icon ${signals.smc}`}><Activity size={17} /></div><div><strong>{signalDescription}</strong><span>{ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · 15m bias {signals.trend} · {settings.entryStrategy === 'scalp' ? `${signals.confirmations} confirming 15m bars (1+ required)` : `${signals.confirmations}/2 confirmations`}</span></div><div className={`signal-pip ${signals.smc}`} /></div>
+                {settings.entryStrategy === 'scalp' && <div className="scalp-diagnostics" aria-label="Scalping signal diagnostics">
+                  <div className="scalp-metrics">
+                    <div><span>RSI 14</span><strong>{signals.rsi === null ? '—' : signals.rsi.toFixed(1)}</strong></div>
+                    <div><span>ATR 14</span><strong>{signals.atr === null || !price ? '—' : `${(signals.atr / price * 100).toFixed(2)}%`}</strong></div>
+                    <div><span>VOL / AVG</span><strong>{signals.volumeRatio === null ? '—' : `${signals.volumeRatio.toFixed(2)}×`}</strong></div>
+                    <div><span>BOT ENTRY</span><strong className={botEntryReady ? 'value-positive' : ''}>{botEntryReady ? 'READY' : 'WAIT'}</strong></div>
+                  </div>
+                  <div className="scalp-checks">{signals.scalpChecks.map((check) => <span key={check.label} className={`scalp-check ${check.status}`} title={`${check.label}: ${check.status}`}><i />{check.label}</span>)}</div>
+                  {marketType === 'spot' && signals.autoSide === 'short' && <div className="scalp-spot-note">Bearish setup blocked in Spot; use Paper Futures to simulate shorts.</div>}
+                </div>}
                 <div className="smc-feature-row" aria-label="SMC feature status">
                   <span className={signals.bos !== 'neutral' ? `active-${signals.bos}` : ''}>BOS</span>
                   <span className={signals.sweep !== 'neutral' ? `active-${signals.sweep}` : ''}>SWEEP</span>
@@ -1571,9 +1609,9 @@ function App() {
                   <span className={signals.fvgRetest !== 'neutral' ? `active-${signals.fvgRetest}` : ''}>FVG RETEST</span>
                 </div>
                 <div className="signal-list">
-                  {(signals.labels.length ? signals.labels.slice(0, 3) : [signals.autoSide ? `${ENTRY_STRATEGY_LABELS[settings.entryStrategy]} conditions aligned` : 'Waiting for the selected strategy signal']).map((label, index) => <div className="signal-list-item" key={`${label}-${index}`}><span className="signal-check"><Check size={11} /></span><span>{label}</span><small>1m</small></div>)}
+                  {signalListLabels.map((label, index) => <div className="signal-list-item" key={`${label}-${index}`}><span className={`signal-check ${settings.entryStrategy === 'scalp' && !signals.autoSide ? 'waiting' : ''}`}>{settings.entryStrategy === 'scalp' && !signals.autoSide ? <Info size={11} /> : <Check size={11} />}</span><span>{label}</span><small>{settings.entryStrategy === 'scalp' && !signals.autoSide ? 'WAIT' : '1m'}</small></div>)}
                 </div>
-                <div className="structure-counts"><div><span className="bull-count">BULLISH</span><strong>{signals.bullCount}</strong></div><div><span className="bear-count">BEARISH</span><strong>{signals.bearCount}</strong></div><div><span>ENTRY GATE</span><strong>{signals.autoSide ? 'READY' : 'WAIT'}</strong></div></div>
+                <div className="structure-counts"><div><span className="bull-count">BULLISH</span><strong>{signals.bullCount}</strong></div><div><span className="bear-count">BEARISH</span><strong>{signals.bearCount}</strong></div><div><span>ENTRY GATE</span><strong>{signalExecutable ? 'READY' : 'WAIT'}</strong></div></div>
                 <div className="signal-caveat"><Info size={12} /> Not a prediction. Order blocks, FVGs and sweeps are simplified heuristics.</div>
               </section>
 
