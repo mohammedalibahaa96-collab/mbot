@@ -32,6 +32,8 @@ import {
   Square,
   TrendingDown,
   TrendingUp,
+  Trash2,
+  TerminalSquare,
   Wallet,
   X,
   Zap,
@@ -131,6 +133,15 @@ type PaperAccount = {
   history: ClosedTrade[]
   position: OpenPosition | null
   settings: Settings
+}
+
+type ConsoleLevel = 'info' | 'success' | 'warning' | 'error'
+type ConsoleEvent = {
+  id: string
+  time: number
+  level: ConsoleLevel
+  source: string
+  message: string
 }
 
 type TestnetOrder = {
@@ -564,7 +575,8 @@ function App() {
   const [showEma, setShowEma] = useState(true)
   const [orderSize, setOrderSize] = useState(10)
   const [isRunning, setIsRunning] = useState(false)
-  const [activeTab, setActiveTab] = useState<'activity' | 'positions' | 'balances'>('activity')
+  const [activeTab, setActiveTab] = useState<'activity' | 'positions' | 'balances' | 'console'>('activity')
+  const [consoleEvents, setConsoleEvents] = useState<ConsoleEvent[]>(() => [{ id: `boot-${Date.now()}`, time: Date.now(), level: 'info', source: 'SYSTEM', message: 'MBOT terminal initialized · mainnet order routing disabled.' }])
   const [showSecurity, setShowSecurity] = useState(true)
   const [showBalanceEditor, setShowBalanceEditor] = useState(false)
   const [newBalance, setNewBalance] = useState('1000')
@@ -578,6 +590,9 @@ function App() {
   const autoTradeCandleRef = useRef(0)
   const symbolInfo = SYMBOLS.find((item) => item.symbol === symbol) || SYMBOLS[0]
   const settings = paper.settings
+  const logEvent = useCallback((source: string, level: ConsoleLevel, message: string) => {
+    setConsoleEvents((current) => [{ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, time: Date.now(), level, source, message }, ...current].slice(0, 100))
+  }, [])
 
   useEffect(() => {
     try { localStorage.setItem(PAPER_STORAGE_KEY, JSON.stringify(paper)) } catch { /* private browsing may block storage */ }
@@ -627,6 +642,7 @@ function App() {
     let retryDelay = 1000
     let retryTimer: number | undefined
     let socket: WebSocket | null = null
+    let reportedOffline = false
     const intervals = [...new Set(['1m', '15m', timeframe])]
     const streams = [`${symbol.toLowerCase()}@ticker`, ...intervals.map((interval) => `${symbol.toLowerCase()}@kline_${interval}`)]
     const socketUrl = `wss://stream.binance.com:9443/stream?streams=${streams.join('/')}`
@@ -641,8 +657,10 @@ function App() {
       }
       socket.onopen = () => {
         retryDelay = 1000
+        reportedOffline = false
         streamConnectedRef.current = true
         setStreamConnected(true)
+        logEvent('FEED', 'success', `Binance market stream connected for ${symbol} (${timeframe}).`)
       }
       socket.onmessage = (event) => {
         try {
@@ -670,9 +688,14 @@ function App() {
       }
       socket.onerror = () => socket?.close()
       socket.onclose = () => {
+        const wasConnected = streamConnectedRef.current
         streamConnectedRef.current = false
         if (active) {
           setStreamConnected(false)
+          if (!reportedOffline) {
+            logEvent('FEED', 'warning', wasConnected ? 'Market stream disconnected · retrying with REST fallback.' : 'WebSocket unavailable · using REST fallback when reachable.')
+            reportedOffline = true
+          }
           scheduleRetry()
         }
       }
@@ -691,7 +714,7 @@ function App() {
       socket?.close(1000)
       setStreamConnected(false)
     }
-  }, [symbol, timeframe])
+  }, [symbol, timeframe, logEvent])
 
   useEffect(() => {
     let live = true
@@ -815,7 +838,8 @@ function App() {
       try { window.dispatchEvent(new CustomEvent('mbot-trade-close', { detail: { reason } })) } catch { /* ignore */ }
     }
     setToast(`${reason} · position closed at ${formatPrice(exitPrice)}`)
-  }, [alertOn, playTradeTone])
+    logEvent('PAPER', 'info', `${reason} · ${position.side.toUpperCase()} ${position.symbol} closed at ${formatPrice(exitPrice)}.`)
+  }, [alertOn, playTradeTone, logEvent])
 
   const currentPosition = paper.position
   useEffect(() => {
@@ -891,18 +915,21 @@ function App() {
       source,
     }
     setPaper((current) => ({ ...current, cash: current.cash - margin - openFee, position }))
+    logEvent(source === 'bot' ? 'BOT' : 'PAPER', 'success', `${side.toUpperCase()} ${symbol} opened · ${formatMoney(notional)} notional at ${formatPrice(price)}.`)
     setToast(`${source === 'bot' ? 'Paper bot' : 'Manual paper'} ${side} opened · ${formatMoney(notional)} notional`)
     if (alertOn && typeof window !== 'undefined') {
       playTradeTone('open')
       try { window.dispatchEvent(new CustomEvent('mbot-trade-open', { detail: { side, symbol } })) } catch { /* ignore */ }
     }
-  }, [marketMode, marketSourceReady, price, paper.position, paper.cash, marketType, dailyLocked, streak.losses, settings, closedToday, orderSize, minNotional, symbol, timeframe, alertOn, playTradeTone])
+  }, [marketMode, marketSourceReady, price, paper.position, paper.cash, marketType, dailyLocked, streak.losses, settings, closedToday, orderSize, minNotional, symbol, timeframe, alertOn, playTradeTone, logEvent])
 
   useEffect(() => {
     if (!isRunning || marketMode !== 'paper') return
     if (dailyLocked || streak.losses >= settings.maxLosses || closedToday >= settings.maxTrades) {
       setIsRunning(false)
-      setToast(dailyLocked ? 'Daily paper limit reached. Bot paused for safety.' : 'Paper bot safety limit reached and is paused.')
+      const reason = dailyLocked ? 'Daily paper limit reached.' : 'Paper bot safety limit reached.'
+      logEvent('GUARD', 'warning', `${reason} Bot paused for safety.`)
+      setToast(`${reason} Bot paused for safety.`)
       return
     }
     if (paper.position || !signals.autoSide || !oneMinuteBars.length) return
@@ -911,7 +938,7 @@ function App() {
     if (marketType === 'spot' && signals.autoSide === 'short') return
     autoTradeCandleRef.current = closed.time
     openPaperPosition(signals.autoSide, 'bot', autoOrderSize())
-  }, [isRunning, marketMode, dailyLocked, streak.losses, settings.maxLosses, settings.maxTrades, closedToday, paper.position, signals, oneMinuteBars, marketType, openPaperPosition, autoOrderSize])
+  }, [isRunning, marketMode, dailyLocked, streak.losses, settings.maxLosses, settings.maxTrades, closedToday, paper.position, signals, oneMinuteBars, marketType, openPaperPosition, autoOrderSize, logEvent])
 
   useEffect(() => {
     if (!toast) return
@@ -1005,6 +1032,7 @@ function App() {
       const order = data as TestnetOrder
       setTestnetOrders((current) => [{ ...order, timeframe }, ...current].slice(0, 100))
       setShowTestnetConfirm(false)
+      logEvent('TESTNET', 'success', `${order.side} ${symbol} ${order.status.toLowerCase()} · order #${order.orderId} · ${formatMoney(order.quoteQty)}.`)
       setToast(`Spot Testnet ${order.side} ${order.status.toLowerCase()} · order #${order.orderId}`)
       void refreshAccount()
     } catch (error) {
@@ -1013,6 +1041,7 @@ function App() {
         setShowTestnetConfirm(false)
         setShowAccessModal(true)
       }
+      logEvent('TESTNET', 'error', message)
       setToast(message)
     } finally {
       setTestnetOrderBusy(false)
@@ -1181,10 +1210,12 @@ function App() {
                     <button className={activeTab === 'activity' ? 'active' : ''} onClick={() => setActiveTab('activity')}>{marketMode === 'testnet' ? 'Testnet orders' : 'Trade history'} <span className="tab-count">{historyCount}</span></button>
                     <button className={activeTab === 'positions' ? 'active' : ''} onClick={() => setActiveTab('positions')}>Open position <span className="tab-count">{paper.position ? '1' : '0'}</span></button>
                     <button className={activeTab === 'balances' ? 'active' : ''} onClick={() => setActiveTab('balances')}>Assets</button>
+                    <button className={activeTab === 'console' ? 'active' : ''} onClick={() => setActiveTab('console')}><TerminalSquare size={12} /> Console <span className="tab-count">{consoleEvents.length}</span></button>
                   </div>
                   <div className="activity-actions">
                     {activeTab === 'activity' && <button className="tool-button" onClick={exportCsv}><FileDown size={14} /> Export CSV</button>}
                     {activeTab === 'balances' && marketMode !== 'paper' && <button className="tool-button" onClick={() => void refreshAccount()}><RefreshCw size={13} /> Sync</button>}
+                    {activeTab === 'console' && <button className="tool-button" onClick={() => setConsoleEvents([])}><Trash2 size={13} /> Clear console</button>}
                   </div>
                 </div>
                 {activeTab === 'activity' && <div className="table-scroll"><table className="data-table">
@@ -1206,6 +1237,16 @@ function App() {
                 </div>}
                 {activeTab === 'balances' && <div className="balances-table-area">
                   {marketMode === 'paper' ? <div className="asset-line"><div className="asset-icon usdt-icon">$</div><div className="asset-name"><strong>USDT</strong><small>Paper quote balance</small></div><div className="asset-amount"><strong>{formatQuantity(paper.cash)}</strong><small>{formatMoney(paper.cash)}</small></div><div className="asset-context">Simulated only</div></div> : accountLoading ? <div className="empty-inline"><RefreshCw size={16} className="spin" /><span>Reading account securely on the server…</span></div> : account?.configured ? account.balances.length ? account.balances.map((balance) => <div className="asset-line" key={balance.asset}><div className="asset-icon asset-generic">{balance.asset.slice(0, 1)}</div><div className="asset-name"><strong>{balance.asset}</strong><small>{marketType === 'futures' ? 'Futures wallet' : 'Spot balance'}</small></div><div className="asset-amount"><strong>{formatQuantity(balance.free + balance.locked)}</strong><small>{formatQuantity(balance.free)} available</small></div><div className="asset-context">Read-only</div></div>) : <div className="empty-inline"><Wallet size={16} /><span>No non-zero assets returned.</span></div> : <div className="empty-inline account-locked"><LockKeyhole size={16} /><span>{accountError || 'Configure read-only API credentials in the server .env.'}</span>{config?.accountAccessConfigured && accountError?.toLowerCase().includes('token') && <button className="auth-link" onClick={() => { setAccessTokenDraft(''); setShowAccessModal(true) }}>Unlock</button>}</div>}
+                </div>}
+                {activeTab === 'console' && <div className="console-terminal">
+                  <div className="console-toolbar"><span><i className="console-live-led" /> LOCAL SESSION / {marketMode.toUpperCase()} / {symbol}</span><span>{consoleEvents.length} EVENTS</span></div>
+                  <div className="console-stream" role="log" aria-live="polite">
+                    {consoleEvents.slice(0, 50).reverse().map((event) => <div className="console-row" key={event.id}>
+                      <time>{formatClock(event.time)}</time><span className={`console-level ${event.level}`}>{event.level.toUpperCase()}</span><b>{event.source}</b><code>{event.message}</code>
+                    </div>)}
+                    {!consoleEvents.length && <div className="console-empty">Console cleared. New runtime events will appear here.</div>}
+                    <div className="console-prompt"><b>mbot&gt;</b><span>monitoring feed · execution policy: {marketMode === 'paper' ? 'PAPER SIMULATION' : marketMode === 'testnet' ? 'TESTNET GATED' : 'MAINNET READ-ONLY'}</span><i /></div>
+                  </div>
                 </div>}
               </section>
             </div>
@@ -1248,9 +1289,9 @@ function App() {
                   <div><span className="status-indicator" /><span>{isRunning ? 'Paper bot running' : 'Bot stopped'}</span></div>
                   <button className={`bot-toggle ${isRunning ? 'running' : ''}`} onClick={() => {
                     if (marketMode !== 'paper') { setToast('Automatic execution is available in Paper mode only.'); return }
-                    if (isRunning) { setIsRunning(false); setToast('Paper bot paused.') }
+                    if (isRunning) { setIsRunning(false); logEvent('BOT', 'warning', 'Paper strategy paused by operator.'); setToast('Paper bot paused.') }
                     else if (!marketSourceReady) setToast('Wait for market data before starting the paper bot.')
-                    else { prepareAudio(); setIsRunning(true); setToast('Paper bot started. Trades are simulated only.') }
+                    else { prepareAudio(); setIsRunning(true); logEvent('BOT', 'success', `Paper strategy started · ${settings.strategy.toUpperCase()} · ${symbol}.`); setToast('Paper bot started. Trades are simulated only.') }
                   }}>
                     {isRunning ? <><Pause size={13} /> Pause</> : <><Play size={13} fill="currentColor" /> Start</>}
                   </button>

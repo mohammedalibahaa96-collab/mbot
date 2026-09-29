@@ -255,6 +255,25 @@ h1 { margin: 5px 0 4px; font-size: 22px; line-height: 1.25; letter-spacing: -.68
 .asset-amount { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; font-family: var(--mono); }
 .asset-amount strong { color: #d5dfe8; font-size: 10px; font-weight: 400; }
 .asset-context { min-width: 70px; text-align: right; color: #63768a; font-size: 8px; }
+.console-terminal { padding: 0 11px 10px; background: linear-gradient(180deg, rgba(5, 9, 14, .7), rgba(7, 11, 16, .96)); }
+.console-toolbar { height: 30px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(128, 150, 177, .08); color: #5c7186; font: 8px var(--mono); letter-spacing: .25px; }
+.console-toolbar > span:first-child { display: flex; align-items: center; gap: 6px; }
+.console-live-led { width: 5px; height: 5px; border-radius: 50%; background: var(--green); box-shadow: 0 0 7px rgba(54, 208, 163, .45); }
+.console-stream { max-height: 208px; overflow: auto; padding: 5px 0 0; font-family: var(--mono); }
+.console-row { min-height: 24px; display: grid; grid-template-columns: 67px 53px 66px minmax(0, 1fr); align-items: center; gap: 7px; border-bottom: 1px solid rgba(128, 150, 177, .035); }
+.console-row time { color: #5f7184; font-size: 8px; }
+.console-level { font-size: 7px; letter-spacing: .35px; }
+.console-level.info { color: #82a8ca; }
+.console-level.success { color: #47d3a6; }
+.console-level.warning { color: #e7b86a; }
+.console-level.error { color: #f07d8d; }
+.console-row b { color: #8092a4; font-size: 7px; font-weight: 500; }
+.console-row code { overflow: hidden; color: #a8b6c4; font: 8px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.console-empty { padding: 28px 6px; color: #687b8f; font: 9px var(--mono); text-align: center; }
+.console-prompt { min-height: 27px; display: flex; align-items: center; gap: 8px; color: #64798e; font: 8px var(--mono); }
+.console-prompt b { color: #46cda2; font-weight: 500; }
+.console-prompt i { width: 6px; height: 11px; background: #48d4a8; opacity: .8; animation: blink .9s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
 
 .order-panel, .strategy-panel, .structure-panel, .insight-panel { padding: 12px; }
 .order-panel-heading, .strategy-heading, .structure-heading, .insight-heading { align-items: flex-start; margin-bottom: 11px; }
