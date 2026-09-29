@@ -47,7 +47,7 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { calculateEma, calculateSignals, getChartMarkers, type Candle, type ChartMarker, type EntryStrategy, type MarketSignals } from './lib/market'
+import { calculateEma, calculateSignals, detectTrianglePattern, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS, type Candle, type ChartLayer, type ChartLayerVisibility, type ChartMarker, type EntryStrategy, type MarketSignals, type TrianglePattern } from './lib/market'
 
 type TradingMode = 'paper' | 'testnet' | 'live'
 type MarketType = 'spot' | 'futures'
@@ -192,6 +192,13 @@ const SYMBOLS: SymbolOption[] = [
   { symbol: 'DGBUSDT', base: 'DGB', quote: 'USDT', name: 'DigiByte' },
 ]
 const TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '1h']
+const CHART_LAYER_OPTIONS: Array<{ key: ChartLayer; label: string; title: string }> = [
+  { key: 'bos', label: 'BOS', title: 'Toggle BOS / CHoCH markers' },
+  { key: 'orderBlock', label: 'OB', title: 'Toggle order-block markers and zone rails' },
+  { key: 'fvg', label: 'FVG', title: 'Toggle fair-value-gap markers and zone rails' },
+  { key: 'sweep', label: 'SWEEP', title: 'Toggle liquidity-sweep markers' },
+  { key: 'triangle', label: 'TRI', title: 'Toggle triangle pattern rails' },
+]
 const ENTRY_STRATEGY_LABELS: Record<EntryStrategy, string> = {
   confluence: 'SMC confluence',
   sweep: 'Liquidity sweep',
@@ -422,7 +429,7 @@ function ChartPanel({
   symbol,
   timeframe,
   showEma,
-  showSignals,
+  layers,
   position,
   history,
   price,
@@ -430,13 +437,13 @@ function ChartPanel({
   error,
   streamConnected,
   onToggleEma,
-  onToggleSignals,
+  onToggleLayer,
 }: {
   candles: Candle[]
   symbol: string
   timeframe: string
   showEma: boolean
-  showSignals: boolean
+  layers: ChartLayerVisibility
   position: OpenPosition | null
   history: ClosedTrade[]
   price: number
@@ -444,12 +451,14 @@ function ChartPanel({
   error: string | null
   streamConnected: boolean
   onToggleEma: () => void
-  onToggleSignals: () => void
+  onToggleLayer: (layer: ChartLayer) => void
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const emaSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
+  const overlaySeriesRef = useRef<Record<'triangleTop' | 'triangleBottom' | 'obTop' | 'obBottom' | 'fvgTop' | 'fvgBottom', ISeriesApi<'Line'> | null>>({ triangleTop: null, triangleBottom: null, obTop: null, obBottom: null, fvgTop: null, fvgBottom: null })
+  const triangleCacheRef = useRef<{ key: string; pattern: TrianglePattern | null }>({ key: '', pattern: null })
   const stopLineRef = useRef<IPriceLine | null>(null)
   const targetLineRef = useRef<IPriceLine | null>(null)
   const appliedCandlesRef = useRef<Candle[]>([])
@@ -459,6 +468,17 @@ function ChartPanel({
     const recent = candles.slice(-90)
     return recent.length ? { high: Math.max(...recent.map((bar) => bar.high)), low: Math.min(...recent.map((bar) => bar.low)) } : null
   }, [candles])
+  const latestBar = candles.at(-1)
+  const latestBarClosed = Boolean(latestBar && (!latestBar.closeTime || latestBar.closeTime < Date.now()))
+  const patternKey = `${candles.length}:${candles[0]?.time || 0}:${latestBar?.time || 0}:${latestBarClosed ? 'closed' : 'open'}`
+  const trianglePattern = useMemo(() => {
+    if (!layers.triangle) return null
+    if (triangleCacheRef.current.key !== patternKey) {
+      triangleCacheRef.current = { key: patternKey, pattern: detectTrianglePattern(candles) }
+    }
+    return triangleCacheRef.current.pattern
+  }, [layers.triangle, patternKey])
+  const chartZones = useMemo(() => (layers.orderBlock || layers.fvg) ? getChartZones(candles) : { orderBlock: null, fvg: null }, [patternKey, layers.orderBlock, layers.fvg])
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -487,9 +507,18 @@ function ChartPanel({
       priceLineStyle: 2,
     })
     const emaSeries = chart.addLineSeries({ color: '#deb45e', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: showEma })
+    const addOverlayLine = (color: string) => chart.addLineSeries({ color, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false })
     chartRef.current = chart
     candleSeriesRef.current = candlesSeries
     emaSeriesRef.current = emaSeries
+    overlaySeriesRef.current = {
+      triangleTop: addOverlayLine('#deb45e'),
+      triangleBottom: addOverlayLine('#37d99b'),
+      obTop: addOverlayLine('#59cda9'),
+      obBottom: addOverlayLine('#59cda9'),
+      fvgTop: addOverlayLine('#80b7d2'),
+      fvgBottom: addOverlayLine('#80b7d2'),
+    }
 
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0]
@@ -503,6 +532,7 @@ function ChartPanel({
       chartRef.current = null
       candleSeriesRef.current = null
       emaSeriesRef.current = null
+      overlaySeriesRef.current = { triangleTop: null, triangleBottom: null, obTop: null, obBottom: null, fvgTop: null, fvgBottom: null }
       stopLineRef.current = null
       targetLineRef.current = null
     }
@@ -514,6 +544,7 @@ function ChartPanel({
     if (!candles.length) {
       series.setData([])
       emaSeriesRef.current?.setData([])
+      for (const overlay of Object.values(overlaySeriesRef.current)) overlay?.setData([])
       appliedCandlesRef.current = []
       return
     }
@@ -545,14 +576,41 @@ function ChartPanel({
   }, [candles])
 
   useEffect(() => {
+    const overlays = overlaySeriesRef.current
+    const setPoints = (series: ISeriesApi<'Line'> | null, points: Array<{ time: number; value: number }> = []) => {
+      series?.setData(points.map((point) => ({ time: point.time as UTCTimestamp, value: point.value })))
+    }
+    setPoints(overlays.triangleTop, layers.triangle && trianglePattern ? trianglePattern.resistance : [])
+    setPoints(overlays.triangleBottom, layers.triangle && trianglePattern ? trianglePattern.support : [])
+
+    const setZone = (upper: ISeriesApi<'Line'> | null, lower: ISeriesApi<'Line'> | null, zone: ReturnType<typeof getChartZones>['fvg'], enabled: boolean, color: string) => {
+      if (!enabled || !zone) { setPoints(upper); setPoints(lower); return }
+      const sideColor = zone.side === 'bull' ? color : '#ef8795'
+      upper?.applyOptions({ color: sideColor })
+      lower?.applyOptions({ color: sideColor })
+      const segment = zone.startTime === zone.endTime
+        ? [{ time: zone.endTime, value: zone.high }]
+        : [{ time: zone.startTime, value: zone.high }, { time: zone.endTime, value: zone.high }]
+      const floor = zone.startTime === zone.endTime
+        ? [{ time: zone.endTime, value: zone.low }]
+        : [{ time: zone.startTime, value: zone.low }, { time: zone.endTime, value: zone.low }]
+      setPoints(upper, segment)
+      setPoints(lower, floor)
+    }
+    setZone(overlays.obTop, overlays.obBottom, chartZones.orderBlock, layers.orderBlock, '#59cda9')
+    setZone(overlays.fvgTop, overlays.fvgBottom, chartZones.fvg, layers.fvg, '#80b7d2')
+  }, [trianglePattern, chartZones, layers.triangle, layers.orderBlock, layers.fvg])
+
+  useEffect(() => {
     const series = candleSeriesRef.current
     if (!series) return
-    const candleSignature = `${showSignals}:${timeframe}:${candles.length}:${candles[0]?.time || 0}:${candles.at(-1)?.time || 0}`
+    const layerSignature = CHART_LAYER_OPTIONS.map(({ key }) => layers[key] ? '1' : '0').join('')
+    const candleSignature = `${layerSignature}:${patternKey}:${timeframe}:${trianglePattern?.kind || ''}:${trianglePattern?.breakout || ''}`
     const historySignature = history.slice(0, 14).map((trade) => trade.id).join(',')
     const signature = `${candleSignature}:${historySignature}`
     if (signature === markerSignatureRef.current) return
     markerSignatureRef.current = signature
-    const chartMarkers: ChartMarker[] = showSignals ? getChartMarkers(candles) : []
+    const chartMarkers: ChartMarker[] = getChartMarkers(candles, layers, trianglePattern)
     const intervalMs = timeframe === '1m' ? 60_000 : timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
     const intervalSeconds = intervalMs / 1000
     const fills = history.slice(0, 14).map((trade) => ({
@@ -563,8 +621,8 @@ function ChartPanel({
       text: trade.result === 'win' ? 'WIN' : trade.result === 'loss' ? 'LOSS' : 'EXIT',
     }))
     const markerTimes = [...chartMarkers, ...fills].sort((a, b) => a.time - b.time)
-    series.setMarkers(markerTimes.map((marker) => ({ ...marker, time: marker.time as UTCTimestamp })))
-  }, [candles, history, showSignals, timeframe])
+    series.setMarkers(markerTimes.map((marker) => ({ time: marker.time as UTCTimestamp, position: marker.position, color: marker.color, shape: marker.shape, text: marker.text })))
+  }, [candles, history, layers, timeframe, trianglePattern, patternKey])
 
   useEffect(() => {
     const series = candleSeriesRef.current
@@ -595,8 +653,12 @@ function ChartPanel({
         </div>
         <div className="chart-actions">
           <button className={`tool-button ${showEma ? 'is-active' : ''}`} onClick={onToggleEma} title="Toggle EMA 20"><span className="legend-line ema-line" /> EMA 20</button>
-          <button className={`tool-button ${showSignals ? 'is-active' : ''}`} onClick={onToggleSignals} title="Toggle heuristic structure markers"><Layers3 size={14} /> SMC markers</button>
           <button className="icon-button" onClick={() => setFull((value) => !value)} title={full ? 'Restore chart' : 'Expand chart'}><Maximize2 size={15} /></button>
+        </div>
+        <div className="chart-layer-row" aria-label="Chart indicator layers">
+          <span className="chart-layer-label">LAYERS</span>
+          {CHART_LAYER_OPTIONS.map(({ key, label, title }) => <button key={key} type="button" className={`layer-chip ${layers[key] ? 'active' : ''}`} aria-pressed={layers[key]} title={title} onClick={() => onToggleLayer(key)}>{label}<i /></button>)}
+          {layers.triangle && trianglePattern && <span className="triangle-readout">{trianglePattern.kind.toUpperCase()} TRIANGLE{trianglePattern.breakout !== 'neutral' ? ` · BREAK ${trianglePattern.breakout.toUpperCase()}` : ''}</span>}
         </div>
       </div>
       <div className="chart-price-strip">
@@ -650,7 +712,7 @@ function App() {
   const [account, setAccount] = useState<AccountResponse | null>(null)
   const [accountLoading, setAccountLoading] = useState(false)
   const [accountError, setAccountError] = useState<string | null>(null)
-  const [showSignals, setShowSignals] = useState(true)
+  const [chartLayers, setChartLayers] = useState<ChartLayerVisibility>(() => ({ ...DEFAULT_CHART_LAYERS }))
   const [showEma, setShowEma] = useState(true)
   const [orderSize, setOrderSize] = useState(10)
   const [isRunning, setIsRunning] = useState(false)
@@ -1323,7 +1385,7 @@ function App() {
                 symbol={symbol}
                 timeframe={timeframe}
                 showEma={showEma}
-                showSignals={showSignals}
+                layers={chartLayers}
                 position={paper.position?.symbol === symbol ? paper.position : null}
                 history={paper.history}
                 price={price}
@@ -1331,7 +1393,7 @@ function App() {
                 error={marketError}
                 streamConnected={streamConnected}
                 onToggleEma={() => setShowEma((value) => !value)}
-                onToggleSignals={() => setShowSignals((value) => !value)}
+                onToggleLayer={(layer) => setChartLayers((current) => ({ ...current, [layer]: !current[layer] }))}
               />
 
               <section className="panel activity-panel">

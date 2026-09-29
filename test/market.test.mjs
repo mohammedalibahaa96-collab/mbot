@@ -7,7 +7,7 @@ const source = await readFile(new URL('../src/lib/market.ts', import.meta.url), 
 const javascript = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
-const { calculateSignals } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`)
+const { calculateSignals, detectTrianglePattern, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS } = await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`)
 
 function risingFifteenMinuteBars() {
   return Array.from({ length: 32 }, (_, index) => ({
@@ -29,6 +29,20 @@ function flatOneMinuteBars(length = 25) {
     close: 100,
     volume: 10,
   }))
+}
+
+function triangleBars(kind) {
+  const bars = Array.from({ length: 40 }, (_, index) => ({
+    time: index * 60,
+    open: 100,
+    high: 101,
+    low: 99,
+    close: 100,
+    volume: 10,
+  }))
+  for (const index of [5, 12, 19, 26, 33]) bars[index].high = kind === 'ascending' ? 110 : 110 - index * 0.18
+  for (const index of [9, 16, 23, 30, 37]) bars[index].low = kind === 'descending' ? 90 : 90 + index * 0.18
+  return bars
 }
 
 const risingBars = risingFifteenMinuteBars()
@@ -87,4 +101,30 @@ test('SMC confluence needs at least two aligned features; an isolated BOS does n
   assert.equal(signals.bos, 'bull')
   assert.equal(signals.fvg, 'bull')
   assert.equal(signals.autoSide, 'long')
+})
+
+test('triangle detector draws ascending, descending, and symmetrical converging rails', () => {
+  const symmetrical = detectTrianglePattern(triangleBars('symmetrical'))
+  assert.equal(symmetrical?.kind, 'symmetrical')
+  assert.equal(symmetrical?.resistance.length, 2)
+  assert.equal(symmetrical?.support.length, 2)
+  assert.ok(symmetrical.resistance[1].value < symmetrical.resistance[0].value)
+  assert.ok(symmetrical.support[1].value > symmetrical.support[0].value)
+
+  assert.equal(detectTrianglePattern(triangleBars('ascending'))?.kind, 'ascending')
+  assert.equal(detectTrianglePattern(triangleBars('descending'))?.kind, 'descending')
+  assert.equal(detectTrianglePattern(flatOneMinuteBars(40)), null)
+})
+
+test('chart layers filter markers independently and return OB/FVG zone rails', () => {
+  const bars = flatOneMinuteBars(30)
+  bars[18] = { ...bars[18], high: 104, low: 103.8, open: 103.9, close: 103.95 }
+  bars[20] = { ...bars[20], high: 106, low: 105, open: 105.2, close: 105.5 }
+  bars[29] = { ...bars[29], open: 100.1, high: 101.2, low: 100, close: 101 }
+  const bosOnly = getChartMarkers(bars, { ...DEFAULT_CHART_LAYERS, orderBlock: false, fvg: false, sweep: false, triangle: false })
+  assert.ok(bosOnly.length)
+  assert.ok(bosOnly.every((marker) => marker.layer === 'bos'))
+  const zones = getChartZones(bars)
+  assert.ok(zones.fvg)
+  assert.ok(zones.fvg.high > zones.fvg.low)
 })

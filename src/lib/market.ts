@@ -27,13 +27,37 @@ export type MarketSignals = {
   autoSide: 'long' | 'short' | null
 }
 
+export type ChartLayer = 'bos' | 'orderBlock' | 'fvg' | 'sweep' | 'triangle'
+export type ChartLayerVisibility = Record<ChartLayer, boolean>
+export const DEFAULT_CHART_LAYERS: ChartLayerVisibility = { bos: true, orderBlock: true, fvg: true, sweep: true, triangle: true }
+
 export type ChartMarker = {
   time: number
   position: 'aboveBar' | 'belowBar'
   color: string
   shape: 'arrowUp' | 'arrowDown' | 'circle' | 'square'
   text: string
+  layer: ChartLayer
 }
+
+export type TrianglePattern = {
+  kind: 'ascending' | 'descending' | 'symmetrical'
+  breakout: SignalKind
+  startTime: number
+  endTime: number
+  resistance: Array<{ time: number; value: number }>
+  support: Array<{ time: number; value: number }>
+}
+
+export type PriceZone = {
+  startTime: number
+  endTime: number
+  low: number
+  high: number
+  side: 'bull' | 'bear'
+}
+
+export type ChartZones = { orderBlock: PriceZone | null; fvg: PriceZone | null }
 
 export function calculateEma(values: number[], period: number): number[] {
   if (values.length === 0) return []
@@ -200,38 +224,194 @@ export function calculateSignals(oneMinute: Candle[], fifteenMinute: Candle[], s
   return { trend, confirmations, smc, bullCount, bearCount, bos, sweep, orderBlock, fvg, fvgRetest, labels, autoSide }
 }
 
-export function getChartMarkers(candles: Candle[]): ChartMarker[] {
+function getClosedCandles(candles: Candle[]) {
+  const now = Date.now()
+  return candles.filter((bar) => !bar.closeTime || bar.closeTime < now)
+}
+
+export function getChartMarkers(
+  candles: Candle[],
+  layers: ChartLayerVisibility = DEFAULT_CHART_LAYERS,
+  triangle: TrianglePattern | null = null,
+): ChartMarker[] {
+  const bars = getClosedCandles(candles)
   const markers: ChartMarker[] = []
-  const start = Math.max(2, candles.length - 120)
-  for (let i = start; i < candles.length; i += 1) {
-    const current = candles[i]
-    const older = candles[i - 2]
-    const neighborhood = candles.slice(Math.max(0, i - 10), i)
-    if (neighborhood.length < 5) continue
+  const start = Math.max(2, bars.length - 120)
+  for (let i = start; i < bars.length; i += 1) {
+    const current = bars[i]
+    const older = bars[i - 2]
+    const neighborhood = bars.slice(Math.max(0, i - 10), i)
+    if (!current || !older || neighborhood.length < 5) continue
     const recentHigh = Math.max(...neighborhood.map((bar) => bar.high))
     const recentLow = Math.min(...neighborhood.map((bar) => bar.low))
+    const localMove = (neighborhood.at(-1)!.close - neighborhood[0].close) / Math.max(neighborhood[0].close, Number.EPSILON)
+    const localBias: MarketDirection = localMove > 0.0005 ? 'up' : localMove < -0.0005 ? 'down' : 'neutral'
 
-    if (current.low > older.high) {
-      markers.push({ time: current.time, position: 'belowBar', color: '#35d6ad', shape: 'circle', text: 'FVG' })
-    } else if (current.high < older.low) {
-      markers.push({ time: current.time, position: 'aboveBar', color: '#ff7a90', shape: 'circle', text: 'FVG' })
+    if (layers.fvg && current.low > older.high) {
+      markers.push({ time: current.time, position: 'belowBar', color: '#59cda9', shape: 'circle', text: 'FVG', layer: 'fvg' })
+    } else if (layers.fvg && current.high < older.low) {
+      markers.push({ time: current.time, position: 'aboveBar', color: '#ef8795', shape: 'circle', text: 'FVG', layer: 'fvg' })
     }
-    if (current.high > recentHigh && current.close < recentHigh) {
-      markers.push({ time: current.time, position: 'aboveBar', color: '#f5bb5d', shape: 'arrowDown', text: 'SWEEP' })
-    } else if (current.low < recentLow && current.close > recentLow) {
-      markers.push({ time: current.time, position: 'belowBar', color: '#f5bb5d', shape: 'arrowUp', text: 'SWEEP' })
+    if (layers.sweep && current.high > recentHigh && current.close < recentHigh) {
+      markers.push({ time: current.time, position: 'aboveBar', color: '#deb45e', shape: 'arrowDown', text: 'SWEEP', layer: 'sweep' })
+    } else if (layers.sweep && current.low < recentLow && current.close > recentLow) {
+      markers.push({ time: current.time, position: 'belowBar', color: '#deb45e', shape: 'arrowUp', text: 'SWEEP', layer: 'sweep' })
     }
-    if (current.close > recentHigh) {
-      markers.push({ time: current.time, position: 'belowBar', color: '#61a9ff', shape: 'arrowUp', text: 'BOS' })
+    if (layers.bos && current.close > recentHigh) {
+      markers.push({ time: current.time, position: 'belowBar', color: '#80b7d2', shape: 'arrowUp', text: localBias === 'down' ? 'CHoCH' : 'BOS', layer: 'bos' })
+    } else if (layers.bos && current.close < recentLow) {
+      markers.push({ time: current.time, position: 'aboveBar', color: '#b59bd2', shape: 'arrowDown', text: localBias === 'up' ? 'CHoCH' : 'BOS', layer: 'bos' })
+    }
+    if (layers.orderBlock && current.close > recentHigh) {
       const block = [...neighborhood].reverse().find((bar) => bar.close < bar.open)
-      if (block) markers.push({ time: block.time, position: 'belowBar', color: '#35d6ad', shape: 'square', text: 'OB' })
-    } else if (current.close < recentLow) {
-      markers.push({ time: current.time, position: 'aboveBar', color: '#c791ff', shape: 'arrowDown', text: 'BOS' })
+      if (block) markers.push({ time: block.time, position: 'belowBar', color: '#59cda9', shape: 'square', text: 'OB', layer: 'orderBlock' })
+    } else if (layers.orderBlock && current.close < recentLow) {
       const block = [...neighborhood].reverse().find((bar) => bar.close > bar.open)
-      if (block) markers.push({ time: block.time, position: 'aboveBar', color: '#ff7a90', shape: 'square', text: 'OB' })
+      if (block) markers.push({ time: block.time, position: 'aboveBar', color: '#ef8795', shape: 'square', text: 'OB', layer: 'orderBlock' })
     }
   }
-  return markers.slice(-60)
+  if (triangle && layers.triangle) {
+    const text = triangle.kind === 'ascending' ? 'ASC TRI' : triangle.kind === 'descending' ? 'DESC TRI' : 'SYM TRI'
+    const breakoutColor = triangle.breakout === 'bull' ? '#59cda9' : triangle.breakout === 'bear' ? '#ef8795' : '#deb45e'
+    markers.push({ time: triangle.endTime, position: triangle.breakout === 'bear' ? 'aboveBar' : 'belowBar', color: breakoutColor, shape: triangle.breakout === 'bear' ? 'arrowDown' : 'square', text, layer: 'triangle' })
+  }
+  return markers.sort((a, b) => a.time - b.time).slice(-100)
+}
+
+export function getChartZones(candles: Candle[]): ChartZones {
+  const bars = getClosedCandles(candles)
+  const endTime = bars.at(-1)?.time || 0
+  let fvg: PriceZone | null = null
+  const fvgStart = Math.max(2, bars.length - 80)
+  for (let index = bars.length - 2; index >= fvgStart; index -= 1) {
+    const gapBar = bars[index]
+    const origin = bars[index - 2]
+    if (!gapBar || !origin) continue
+    if (gapBar.low > origin.high) {
+      const low = origin.high
+      const high = gapBar.low
+      const mitigated = bars.slice(index + 1).some((bar) => bar.low <= low)
+      if (!mitigated) { fvg = { startTime: gapBar.time, endTime, low, high, side: 'bull' }; break }
+    } else if (gapBar.high < origin.low) {
+      const low = gapBar.high
+      const high = origin.low
+      const mitigated = bars.slice(index + 1).some((bar) => bar.high >= high)
+      if (!mitigated) { fvg = { startTime: gapBar.time, endTime, low, high, side: 'bear' }; break }
+    }
+  }
+
+  let orderBlock: PriceZone | null = null
+  const breakStart = Math.max(9, bars.length - 48)
+  for (let index = bars.length - 2; index >= breakStart; index -= 1) {
+    const breakBar = bars[index]
+    const before = bars.slice(Math.max(0, index - 8), index)
+    if (!breakBar || before.length < 5) continue
+    const brokeUp = breakBar.close > Math.max(...before.map((bar) => bar.high))
+    const brokeDown = breakBar.close < Math.min(...before.map((bar) => bar.low))
+    if (brokeUp) {
+      const block = [...before].reverse().find((bar) => bar.close < bar.open)
+      if (block) {
+        const low = block.low
+        const high = Math.max(block.open, block.close)
+        const invalidated = bars.slice(index + 1).some((bar) => bar.close < low)
+        if (!invalidated) { orderBlock = { startTime: block.time, endTime, low, high, side: 'bull' }; break }
+      }
+    }
+    if (brokeDown) {
+      const block = [...before].reverse().find((bar) => bar.close > bar.open)
+      if (block) {
+        const low = Math.min(block.open, block.close)
+        const high = block.high
+        const invalidated = bars.slice(index + 1).some((bar) => bar.close > high)
+        if (!invalidated) { orderBlock = { startTime: block.time, endTime, low, high, side: 'bear' }; break }
+      }
+    }
+  }
+  return { orderBlock, fvg }
+}
+
+type Pivot = { index: number; time: number; price: number }
+type FittedLine = { slope: number; intercept: number; error: number; at: (index: number) => number }
+
+function fitLine(points: Pivot[]): FittedLine | null {
+  if (points.length < 2) return null
+  const meanX = points.reduce((sum, point) => sum + point.index, 0) / points.length
+  const meanY = points.reduce((sum, point) => sum + point.price, 0) / points.length
+  const denominator = points.reduce((sum, point) => sum + (point.index - meanX) ** 2, 0)
+  if (!denominator) return null
+  const slope = points.reduce((sum, point) => sum + (point.index - meanX) * (point.price - meanY), 0) / denominator
+  const intercept = meanY - slope * meanX
+  const error = Math.sqrt(points.reduce((sum, point) => sum + (point.price - (slope * point.index + intercept)) ** 2, 0) / points.length)
+  return { slope, intercept, error, at: (index) => slope * index + intercept }
+}
+
+/** Closed-candle swing-pivot approximation; patterns are descriptive overlays, not predictions. */
+export function detectTrianglePattern(candles: Candle[]): TrianglePattern | null {
+  const bars = getClosedCandles(candles)
+  if (bars.length < 28) return null
+  const firstIndex = Math.max(2, bars.length - 100)
+  const highs: Pivot[] = []
+  const lows: Pivot[] = []
+  for (let index = firstIndex; index < bars.length - 2; index += 1) {
+    const bar = bars[index]
+    const left = bars[index - 1]
+    const left2 = bars[index - 2]
+    const right = bars[index + 1]
+    const right2 = bars[index + 2]
+    if (!bar || !left || !left2 || !right || !right2) continue
+    if (bar.high >= left.high && bar.high >= left2.high && bar.high > right.high && bar.high >= right2.high) highs.push({ index, time: bar.time, price: bar.high })
+    if (bar.low <= left.low && bar.low <= left2.low && bar.low < right.low && bar.low <= right2.low) lows.push({ index, time: bar.time, price: bar.low })
+  }
+  const selectedHighs = highs.slice(-4)
+  const selectedLows = lows.slice(-4)
+  if (selectedHighs.length < 3 || selectedLows.length < 3) return null
+  const upper = fitLine(selectedHighs)
+  const lower = fitLine(selectedLows)
+  if (!upper || !lower) return null
+
+  const averagePrice = bars.slice(-60).reduce((sum, bar) => sum + bar.close, 0) / Math.min(bars.length, 60)
+  const upperRate = upper.slope / averagePrice
+  const lowerRate = lower.slope / averagePrice
+  const kind = upperRate < -0.00008 && lowerRate > 0.00008
+    ? 'symmetrical'
+    : Math.abs(upperRate) <= 0.00018 && lowerRate > 0.00008
+      ? 'ascending'
+      : upperRate < -0.00008 && Math.abs(lowerRate) <= 0.00018
+        ? 'descending'
+        : null
+  if (!kind || upper.error / averagePrice > 0.012 || lower.error / averagePrice > 0.012) return null
+
+  const startIndex = Math.min(selectedHighs[0].index, selectedLows[0].index)
+  const endIndex = bars.length - 1
+  const startGap = upper.at(startIndex) - lower.at(startIndex)
+  const endGap = upper.at(endIndex) - lower.at(endIndex)
+  if (startGap <= averagePrice * 0.001 || endGap <= 0 || endGap >= startGap * 0.94) return null
+
+  const last = bars[endIndex]
+  const priorBar = bars[endIndex - 1]
+  if (!last || !priorBar) return null
+  const upperAtLast = upper.at(endIndex)
+  const lowerAtLast = lower.at(endIndex)
+  const upperBefore = upper.at(endIndex - 1)
+  const lowerBefore = lower.at(endIndex - 1)
+  const breakout: SignalKind = last.close > upperAtLast && priorBar.close <= upperBefore
+    ? 'bull'
+    : last.close < lowerAtLast && priorBar.close >= lowerBefore
+      ? 'bear'
+      : 'neutral'
+  const outsideDistance = Math.max(lowerAtLast - last.close, last.close - upperAtLast, 0)
+  if (breakout === 'neutral' && outsideDistance > averagePrice * 0.002) return null
+
+  const startTime = bars[startIndex].time
+  const endTime = last.time
+  return {
+    kind,
+    breakout,
+    startTime,
+    endTime,
+    resistance: [{ time: startTime, value: upper.at(startIndex) }, { time: endTime, value: upperAtLast }],
+    support: [{ time: startTime, value: lower.at(startIndex) }, { time: endTime, value: lowerAtLast }],
+  }
 }
 
 export function getEmaPoints(candles: Candle[], period = 20) {
