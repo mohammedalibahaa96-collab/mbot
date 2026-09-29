@@ -255,6 +255,8 @@ h1 { margin: 5px 0 4px; font-size: 22px; line-height: 1.25; letter-spacing: -.68
 .asset-amount { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; font-family: var(--mono); }
 .asset-amount strong { color: #d5dfe8; font-size: 10px; font-weight: 400; }
 .asset-context { min-width: 70px; text-align: right; color: #63768a; font-size: 8px; }
+.account-refresh-note { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0 1px; color: #607c72; font: 7px var(--mono); }
+.account-refresh-note strong { color: #d3ae69; font-weight: 400; text-align: right; }
 .console-terminal { padding: 0 11px 10px; background: linear-gradient(180deg, rgba(5, 9, 14, .7), rgba(7, 11, 16, .96)); }
 .console-toolbar { height: 30px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(128, 150, 177, .08); color: #5c7186; font: 8px var(--mono); letter-spacing: .25px; }
 .console-toolbar > span:first-child { display: flex; align-items: center; gap: 6px; }
@@ -351,6 +353,7 @@ h1 { margin: 5px 0 4px; font-size: 22px; line-height: 1.25; letter-spacing: -.68
 .bot-toggle.running { border-color: rgba(244, 187, 94, .24); background: rgba(244, 187, 94, .08); color: #e3b86c; }
 .strategy-form { margin-top: 10px; }
 .demo-only-label { display: flex; align-items: center; gap: 3px; padding: 3px 5px; border-radius: 3px; background: rgba(54, 195, 154, .08); color: #61cba8 !important; font-size: 7px !important; }
+.sizing-label-row { margin-top: 9px; }
 .select-wrap { position: relative; height: 30px; display: flex; align-items: center; border: 1px solid rgba(128, 150, 177, .13); border-radius: 4px; background: #0b1119; }
 .select-wrap select { width: 100%; height: 100%; appearance: none; padding: 0 27px 0 8px; border: 0; outline: none; background: transparent; color: #c2ceda; font-size: 9px; cursor: pointer; }
 .select-wrap > svg { position: absolute; right: 8px; color: #728398; pointer-events: none; }
@@ -400,6 +403,10 @@ h1 { margin: 5px 0 4px; font-size: 22px; line-height: 1.25; letter-spacing: -.68
 .signal-summary > div:nth-child(2) { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .signal-summary strong { color: #c8d3dd; font-size: 9px; }
 .signal-summary span { color: #6c7e91; font-size: 7px; }
+.smc-feature-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 7px; }
+.smc-feature-row span { overflow: hidden; padding: 4px 3px; border: 1px solid rgba(128, 150, 177, .1); border-radius: 3px; color: #65768a; font: 6px var(--mono); text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+.smc-feature-row span.active-bull { border-color: rgba(54, 208, 163, .25); color: #61d4ad; background: rgba(54, 208, 163, .06); }
+.smc-feature-row span.active-bear { border-color: rgba(251, 113, 133, .23); color: #ef8795; background: rgba(251, 113, 133, .06); }
 .signal-pip { width: 6px; height: 6px; margin-left: auto; border-radius: 50%; background: #68788a; }
 .signal-pip.bull { background: var(--green); }
 .signal-pip.bear { background: var(--red); }
@@ -575,3 +582,71 @@ h1 { margin: 5px 0 4px; font-size: 22px; line-height: 1.25; letter-spacing: -.68
   .data-table th, .data-table td { padding-left: 7px; padding-right: 7px; }
   .page-footer > span:nth-child(2) { display: none; }
 }
+
+/* Compact monochrome terminal skin: flat surfaces, sharp separators, minimal decoration. */
+.app-shell.terminal-theme {
+  color-scheme: dark;
+  --bg: #050809;
+  --panel: #0a1011;
+  --panel-raised: #0c1515;
+  --stroke: rgba(96, 145, 127, .17);
+  --stroke-bright: rgba(96, 145, 127, .28);
+  --text: #d6e3dd;
+  --muted: #74847d;
+  --muted2: #52635c;
+  --green: #37d99b;
+  --green-bright: #58e6ae;
+  --red: #f07881;
+  --amber: #deb45e;
+  --blue: #80b7d2;
+  --purple: #b59bd2;
+  background: var(--bg);
+}
+.terminal-theme .topbar,
+.terminal-theme .rail { background: #060b0c; backdrop-filter: none; }
+.terminal-theme .topbar { border-bottom-color: var(--stroke); }
+.terminal-theme .brand-mark { border: 1px solid rgba(55, 217, 155, .25); border-radius: 4px; background: #0b2119; box-shadow: none; color: var(--green); }
+.terminal-theme .avatar { border-radius: 4px; background: #10201a; border-color: var(--stroke-bright); color: #83dbb5; }
+.terminal-theme .panel,
+.terminal-theme .metric-card { border-color: var(--stroke); border-radius: 3px; background: #091011; box-shadow: none; }
+.terminal-theme .market-toolbar,
+.terminal-theme .activity-heading,
+.terminal-theme .chart-heading,
+.terminal-theme .console-terminal { background: #080e0f; }
+.terminal-theme .chart-wrap { background: #080e0f; }
+.terminal-theme .security-banner { border-radius: 3px; background: #12100a; }
+.terminal-theme .mode-picker,
+.terminal-theme .exchange-status,
+.terminal-theme .market-type-switch,
+.terminal-theme .select-wrap,
+.terminal-theme .input-with-unit,
+.terminal-theme .mini-input,
+.terminal-theme .cooldown-readout,
+.terminal-theme .search-box { border-radius: 3px; background-color: #060b0c; }
+.terminal-theme .strategy-status-row,
+.terminal-theme .order-market-row,
+.terminal-theme .signal-summary { border-radius: 3px; background: #0a1212; }
+.terminal-theme .button,
+.terminal-theme .tool-button,
+.terminal-theme .icon-button,
+.terminal-theme .side-button,
+.terminal-theme .quick-sizes button,
+.terminal-theme .bot-toggle { border-radius: 3px; box-shadow: none; }
+.terminal-theme .button.primary-order-button { border-color: #27ba82; background: #22a975; color: #03110b; box-shadow: none; }
+.terminal-theme .button.primary-order-button:hover { background: #35c58c; }
+.terminal-theme .market-toolbar,
+.terminal-theme .chart-heading,
+.terminal-theme .activity-heading,
+.terminal-theme .ticket-bottom-row { border-color: var(--stroke); }
+.terminal-theme .data-table thead { background: #0b1313; }
+.terminal-theme .data-table td,
+.terminal-theme .data-table th { border-bottom-color: rgba(96, 145, 127, .08); }
+.terminal-theme .top-icon-button:hover,
+.terminal-theme .rail-icon:hover { background: #0d1714; }
+.terminal-theme .rail-icon.selected { border-color: rgba(55, 217, 155, .2); background: #0a1a13; color: var(--green); }
+.terminal-theme .rail-icon.selected::before { border-radius: 0; }
+.terminal-theme .signal-icon,
+.terminal-theme .asset-icon,
+.terminal-theme .metric-icon { border-radius: 3px; }
+.terminal-theme .console-stream { scrollbar-color: #20362c #070b0c; }
+.terminal-theme .page-footer { color: #596d64; }

@@ -10,9 +10,10 @@ Secrets belong in a server-side `.env` file on the computer running the API. The
 
 ## What is implemented
 
-- Live Binance public ticker and candlesticks for SHIB, BTC, ETH, SOL, BNB, and DGB against USDT; selectable 1m, 5m, 15m, and 1h chart intervals.
-- Candlestick chart with EMA 20 and simplified BOS/FVG/liquidity-sweep markers. These are educational heuristics, not validated SMC detection or predictions.
-- 15-minute bias and two-candle confirmation monitor.
+- Binance public ticker/candlestick feed for SHIB, BTC, ETH, SOL, BNB, and DGB against USDT; selectable 1m, 5m, 15m, and 1h intervals. WebSocket is the live path, reconnects with backoff, and REST polling backs it up every 15 seconds when disconnected. The UI shows feed status and freshness.
+- A compact terminal theme and incremental chart updates for live candles; account balances refresh automatically every 15 seconds and retain the last successful snapshot during refresh.
+- EMA 20 plus simplified BOS/CHoCH, order-block, FVG, and liquidity-sweep markers. These are educational heuristics, not validated SMC detection or predictions.
+- Six selectable Paper entry rules: SMC confluence, liquidity-sweep reversal, BOS/CHoCH continuation, order-block retest, FVG retest, and 15-minute trend with two candle confirmations. Each uses closed candles and the 15-minute direction/confirmation filter; signals can be absent or wrong and are not guarantees.
 - Local paper wallet with editable starting USDT balance, simulated spot/futures positions, basic fees, stop-loss/take-profit monitoring, trade history with per-trade time, configurable bot trade cooldown (1–60 seconds/minutes), CSV export, and capped strategy controls.
 - Terminal-style runtime console for feed connection/retry, paper entries/exits, bot controls, safety pauses, and Testnet order results.
 - Optional server-side, advisory-only OpenRouter/DeepSeek commentary. It cannot submit an order.
@@ -44,7 +45,7 @@ npm run build
 npm start
 ```
 
-Run the Testnet safety-gate suite with `npm test`.
+Run the SMC entry-rule and Testnet safety-gate tests with `npm test`.
 
 If market data is unavailable in your region, check network access to `api.binance.com`. The paper ledger is stored in this browser's local storage and does not sync across devices. Use **Reset demo wallet** to change its starting balance; this does not change exchange funds.
 

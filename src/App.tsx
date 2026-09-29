@@ -47,11 +47,11 @@ import {
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts'
-import { calculateEma, calculateSignals, getChartMarkers, type Candle, type ChartMarker, type MarketSignals } from './lib/market'
+import { calculateEma, calculateSignals, getChartMarkers, type Candle, type ChartMarker, type EntryStrategy, type MarketSignals } from './lib/market'
 
 type TradingMode = 'paper' | 'testnet' | 'live'
 type MarketType = 'spot' | 'futures'
-type Strategy = 'smc' | 'fixed' | 'martingale' | 'anti'
+type SizingStrategy = 'fixed' | 'martingale' | 'anti'
 type TradeIntervalUnit = 'seconds' | 'minutes'
 type TradeSide = 'long' | 'short'
 type Timeframe = '1m' | '5m' | '15m' | '1h'
@@ -78,7 +78,8 @@ type ExchangeBalance = {
 }
 
 type Settings = {
-  strategy: Strategy
+  entryStrategy: EntryStrategy
+  sizingStrategy: SizingStrategy
   baseOrder: number
   maxOrder: number
   multiplier: number
@@ -191,8 +192,17 @@ const SYMBOLS: SymbolOption[] = [
   { symbol: 'DGBUSDT', base: 'DGB', quote: 'USDT', name: 'DigiByte' },
 ]
 const TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '1h']
+const ENTRY_STRATEGY_LABELS: Record<EntryStrategy, string> = {
+  confluence: 'SMC confluence',
+  sweep: 'Liquidity sweep',
+  structure: 'BOS / CHoCH',
+  orderBlock: 'Order-block retest',
+  fvgRetest: 'FVG retest',
+  trend: '15m trend confirmation',
+}
 const DEFAULT_SETTINGS: Settings = {
-  strategy: 'smc',
+  entryStrategy: 'confluence',
+  sizingStrategy: 'fixed',
   baseOrder: 10,
   maxOrder: 30,
   multiplier: 2,
@@ -222,9 +232,14 @@ function clampNumber(value: unknown, minimum: number, maximum: number, fallback:
 
 function normalizeSettings(value: Partial<Settings> = {}): Settings {
   const merged = { ...DEFAULT_SETTINGS, ...value }
-  const strategies: Strategy[] = ['smc', 'fixed', 'martingale', 'anti']
+  const legacyStrategy = (value as Partial<Settings> & { strategy?: string }).strategy
+  const entryStrategies: EntryStrategy[] = ['confluence', 'sweep', 'structure', 'orderBlock', 'fvgRetest', 'trend']
+  const sizingStrategies: SizingStrategy[] = ['fixed', 'martingale', 'anti']
+  const rawEntryStrategy = (value as Partial<Settings>).entryStrategy
+  const rawSizingStrategy = (value as Partial<Settings>).sizingStrategy
   return {
-    strategy: strategies.includes(merged.strategy) ? merged.strategy : 'smc',
+    entryStrategy: rawEntryStrategy && entryStrategies.includes(rawEntryStrategy) ? rawEntryStrategy : 'confluence',
+    sizingStrategy: rawSizingStrategy && sizingStrategies.includes(rawSizingStrategy) ? rawSizingStrategy : legacyStrategy === 'martingale' ? 'martingale' : legacyStrategy === 'anti' ? 'anti' : 'fixed',
     baseOrder: clampNumber(merged.baseOrder, 1, 100_000, DEFAULT_SETTINGS.baseOrder),
     maxOrder: clampNumber(merged.maxOrder, 1, 100_000, DEFAULT_SETTINGS.maxOrder),
     multiplier: clampNumber(merged.multiplier, 1, 3, DEFAULT_SETTINGS.multiplier),
@@ -262,10 +277,19 @@ function loadPaper(): PaperAccount {
 }
 
 async function getJson<T>(url: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, { ...init, cache: 'no-store' })
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data?.error || `Request failed (${response.status})`)
-  return data as T
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), 12_000)
+  try {
+    const response = await fetch(url, { ...init, cache: 'no-store', signal: controller.signal })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data?.error || `Request failed (${response.status})`)
+    return data as T
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Request timed out. Check your network connection and Binance API access.')
+    throw error
+  } finally {
+    window.clearTimeout(timeout)
+  }
 }
 
 async function getPublicJson<T>(apiPath: string): Promise<T> {
@@ -359,11 +383,6 @@ function formatDuration(durationMs: number) {
   return `${seconds}s`
 }
 
-function dailyPnl(history: ClosedTrade[], openPnl: number) {
-  const day = new Date().toDateString()
-  return history.filter((trade) => new Date(trade.time).toDateString() === day).reduce((sum, trade) => sum + trade.pnl, 0) + openPnl
-}
-
 function getStreak(history: ClosedTrade[]) {
   let wins = 0
   let losses = 0
@@ -376,13 +395,22 @@ function getStreak(history: ClosedTrade[]) {
 }
 
 function mergeCandle(current: Candle[], next: Candle[], limit = 240) {
-  const updated = [...current]
-  for (const candle of next) {
-    const index = updated.findIndex((item) => item.time === candle.time)
-    if (index >= 0) updated[index] = candle
-    else updated.push(candle)
+  if (!next.length) return current
+  if (next.length === 1) {
+    const candle = next[0]
+    const latest = current.at(-1)
+    if (latest && candle.time === latest.time) {
+      if (candle.open === latest.open && candle.high === latest.high && candle.low === latest.low && candle.close === latest.close && candle.volume === latest.volume && candle.closeTime === latest.closeTime) return current
+      const updated = current.slice()
+      updated[updated.length - 1] = candle
+      return updated
+    }
+    if (!latest || candle.time > latest.time) return [...current, candle].slice(-limit)
   }
-  return updated.sort((a, b) => a.time - b.time).slice(-limit)
+  // REST bootstrap/recovery can contain a batch; keep this slower merge off the live hot path.
+  const byTime = new Map(current.map((candle) => [candle.time, candle]))
+  for (const candle of next) byTime.set(candle.time, candle)
+  return [...byTime.values()].sort((a, b) => a.time - b.time).slice(-limit)
 }
 
 function smaMarkerTime(time: number) {
@@ -424,35 +452,41 @@ function ChartPanel({
   const emaSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const stopLineRef = useRef<IPriceLine | null>(null)
   const targetLineRef = useRef<IPriceLine | null>(null)
+  const appliedCandlesRef = useRef<Candle[]>([])
+  const markerSignatureRef = useRef('')
   const [full, setFull] = useState(false)
+  const chartRange = useMemo(() => {
+    const recent = candles.slice(-90)
+    return recent.length ? { high: Math.max(...recent.map((bar) => bar.high)), low: Math.min(...recent.map((bar) => bar.low)) } : null
+  }, [candles])
 
   useEffect(() => {
     if (!containerRef.current) return
     const chart = createChart(containerRef.current, {
       width: containerRef.current.clientWidth,
       height: containerRef.current.clientHeight,
-      layout: { background: { type: ColorType.Solid, color: '#0b1119' }, textColor: '#718096', fontFamily: 'Inter, ui-sans-serif, system-ui', fontSize: 11 },
-      grid: { vertLines: { color: 'rgba(119, 139, 164, 0.065)' }, horzLines: { color: 'rgba(119, 139, 164, 0.075)' } },
-      crosshair: { mode: CrosshairMode.Normal, vertLine: { color: 'rgba(124, 153, 188, 0.3)', width: 1, style: 3, labelBackgroundColor: '#263548' }, horzLine: { color: 'rgba(124, 153, 188, 0.3)', width: 1, style: 3, labelBackgroundColor: '#263548' } },
-      rightPriceScale: { borderColor: 'rgba(119, 139, 164, 0.13)', scaleMargins: { top: 0.09, bottom: 0.1 } },
-      timeScale: { borderColor: 'rgba(119, 139, 164, 0.13)', timeVisible: true, secondsVisible: false, rightOffset: 5, barSpacing: 7 },
+      layout: { background: { type: ColorType.Solid, color: '#080e0f' }, textColor: '#71827a', fontFamily: 'DM Mono, ui-monospace, monospace', fontSize: 10 },
+      grid: { vertLines: { color: 'rgba(96, 145, 127, 0.055)' }, horzLines: { color: 'rgba(96, 145, 127, 0.065)' } },
+      crosshair: { mode: CrosshairMode.Normal, vertLine: { color: 'rgba(108, 169, 144, 0.27)', width: 1, style: 3, labelBackgroundColor: '#12241c' }, horzLine: { color: 'rgba(108, 169, 144, 0.27)', width: 1, style: 3, labelBackgroundColor: '#12241c' } },
+      rightPriceScale: { borderColor: 'rgba(96, 145, 127, 0.14)', scaleMargins: { top: 0.09, bottom: 0.1 } },
+      timeScale: { borderColor: 'rgba(96, 145, 127, 0.14)', timeVisible: true, secondsVisible: false, rightOffset: 5, barSpacing: 7 },
       localization: { priceFormatter: (value: number) => formatPrice(value) },
       handleScroll: { mouseWheel: true, pressedMouseMove: true },
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     })
     const candlesSeries = chart.addCandlestickSeries({
-      upColor: '#28c59a',
-      downColor: '#f06d82',
-      borderUpColor: '#28c59a',
-      borderDownColor: '#f06d82',
-      wickUpColor: '#28c59a',
-      wickDownColor: '#f06d82',
+      upColor: '#37d99b',
+      downColor: '#f07881',
+      borderUpColor: '#37d99b',
+      borderDownColor: '#f07881',
+      wickUpColor: '#37d99b',
+      wickDownColor: '#f07881',
       lastValueVisible: true,
       priceLineVisible: true,
-      priceLineColor: '#5c83a8',
+      priceLineColor: '#4d7e68',
       priceLineStyle: 2,
     })
-    const emaSeries = chart.addLineSeries({ color: '#e9b65b', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: showEma })
+    const emaSeries = chart.addLineSeries({ color: '#deb45e', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, visible: showEma })
     chartRef.current = chart
     candleSeriesRef.current = candlesSeries
     emaSeriesRef.current = emaSeries
@@ -476,30 +510,65 @@ function ChartPanel({
 
   useEffect(() => {
     const series = candleSeriesRef.current
-    const chart = chartRef.current
-    if (!series || !chart) return
+    if (!series) return
     if (!candles.length) {
       series.setData([])
       emaSeriesRef.current?.setData([])
-      if (stopLineRef.current) series.removePriceLine(stopLineRef.current)
-      if (targetLineRef.current) series.removePriceLine(targetLineRef.current)
-      stopLineRef.current = null
-      targetLineRef.current = null
+      appliedCandlesRef.current = []
       return
     }
-    series.setData(candles.map((bar) => ({ time: bar.time as UTCTimestamp, open: bar.open, high: bar.high, low: bar.low, close: bar.close })))
-    const values = calculateEma(candles.map((bar) => bar.close), 20)
-    emaSeriesRef.current?.setData(candles.map((bar, index) => ({ time: smaMarkerTime(bar.time), value: values[index] })))
+
+    const previous = appliedCandlesRef.current
+    const latest = candles.at(-1)!
+    const prefixLength = candles.length === previous.length ? previous.length - 1 : candles.length === previous.length + 1 ? previous.length : -1
+    let canUpdateLatest = prefixLength >= 0 && previous.length > 0 && candles[0].time === previous[0].time
+    if (canUpdateLatest) {
+      for (let index = 0; index < prefixLength; index += 1) {
+        const oldBar = previous[index]
+        const newBar = candles[index]
+        if (!oldBar || !newBar || oldBar.time !== newBar.time || oldBar.open !== newBar.open || oldBar.high !== newBar.high || oldBar.low !== newBar.low || oldBar.close !== newBar.close || oldBar.volume !== newBar.volume) {
+          canUpdateLatest = false
+          break
+        }
+      }
+    }
+    if (canUpdateLatest) {
+      series.update({ time: latest.time as UTCTimestamp, open: latest.open, high: latest.high, low: latest.low, close: latest.close })
+      const latestEma = calculateEma(candles.map((bar) => bar.close), 20).at(-1)
+      if (latestEma !== undefined) emaSeriesRef.current?.update({ time: smaMarkerTime(latest.time), value: latestEma })
+    } else {
+      series.setData(candles.map((bar) => ({ time: bar.time as UTCTimestamp, open: bar.open, high: bar.high, low: bar.low, close: bar.close })))
+      const values = calculateEma(candles.map((bar) => bar.close), 20)
+      emaSeriesRef.current?.setData(candles.map((bar, index) => ({ time: smaMarkerTime(bar.time), value: values[index] })))
+    }
+    appliedCandlesRef.current = candles
+  }, [candles])
+
+  useEffect(() => {
+    const series = candleSeriesRef.current
+    if (!series) return
+    const candleSignature = `${showSignals}:${timeframe}:${candles.length}:${candles[0]?.time || 0}:${candles.at(-1)?.time || 0}`
+    const historySignature = history.slice(0, 14).map((trade) => trade.id).join(',')
+    const signature = `${candleSignature}:${historySignature}`
+    if (signature === markerSignatureRef.current) return
+    markerSignatureRef.current = signature
     const chartMarkers: ChartMarker[] = showSignals ? getChartMarkers(candles) : []
-    const fills = history.slice(0, 14).flatMap((trade) => [{
-      time: Math.floor(trade.time / (timeframe === '1m' ? 60_000 : timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000)) * (timeframe === '1m' ? 60 : timeframe === '5m' ? 300 : timeframe === '15m' ? 900 : 3600),
+    const intervalMs = timeframe === '1m' ? 60_000 : timeframe === '5m' ? 300_000 : timeframe === '15m' ? 900_000 : 3_600_000
+    const intervalSeconds = intervalMs / 1000
+    const fills = history.slice(0, 14).map((trade) => ({
+      time: Math.floor(trade.time / intervalMs) * intervalSeconds,
       position: trade.side === 'long' ? 'belowBar' as const : 'aboveBar' as const,
       color: trade.pnl >= 0 ? '#27c59a' : '#f06d82',
       shape: trade.side === 'long' ? 'arrowUp' as const : 'arrowDown' as const,
       text: trade.result === 'win' ? 'WIN' : trade.result === 'loss' ? 'LOSS' : 'EXIT',
-    }])
+    }))
     const markerTimes = [...chartMarkers, ...fills].sort((a, b) => a.time - b.time)
     series.setMarkers(markerTimes.map((marker) => ({ ...marker, time: marker.time as UTCTimestamp })))
+  }, [candles, history, showSignals, timeframe])
+
+  useEffect(() => {
+    const series = candleSeriesRef.current
+    if (!series) return
     if (stopLineRef.current) series.removePriceLine(stopLineRef.current)
     if (targetLineRef.current) series.removePriceLine(targetLineRef.current)
     stopLineRef.current = null
@@ -508,7 +577,7 @@ function ChartPanel({
       stopLineRef.current = series.createPriceLine({ price: position.stopLoss, color: '#f06d82', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'SL' })
       targetLineRef.current = series.createPriceLine({ price: position.takeProfit, color: '#28c59a', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'TP' })
     }
-  }, [candles, history, position, showSignals, timeframe])
+  }, [position])
 
   useEffect(() => {
     emaSeriesRef.current?.applyOptions({ visible: showEma })
@@ -532,7 +601,7 @@ function ChartPanel({
       </div>
       <div className="chart-price-strip">
         <div className="chart-last-price">{formatPrice(price)} <span>USDT</span></div>
-        <div className="chart-high-low"><span><small>H</small> {candles.length ? formatPrice(Math.max(...candles.slice(-90).map((c) => c.high))) : '—'}</span><span><small>L</small> {candles.length ? formatPrice(Math.min(...candles.slice(-90).map((c) => c.low))) : '—'}</span></div>
+        <div className="chart-high-low"><span><small>H</small> {chartRange ? formatPrice(chartRange.high) : '—'}</span><span><small>L</small> {chartRange ? formatPrice(chartRange.low) : '—'}</span></div>
       </div>
       <div className="chart-wrap" ref={containerRef}>
         {!candles.length && <div className="chart-empty"><div className="empty-orbit"><Activity size={20} /></div><strong>{loading ? 'Connecting to Binance market data' : 'Market feed unavailable'}</strong><span>{error || 'Waiting for the public candle feed…'}</span></div>}
@@ -568,7 +637,10 @@ function App() {
   const [marketError, setMarketError] = useState<string | null>(null)
   const [streamConnected, setStreamConnected] = useState(false)
   const streamConnectedRef = useRef(false)
+  const marketRequestInFlightRef = useRef('')
+  const marketRequestSequenceRef = useRef(0)
   const [lastUpdate, setLastUpdate] = useState(0)
+  const lastUpdateRef = useRef(0)
   const [config, setConfig] = useState<ApiConfig | null>(null)
   const [accessToken, setAccessToken] = useState(() => {
     try { return sessionStorage.getItem('mbot-local-access-token') || '' } catch { return '' }
@@ -595,6 +667,7 @@ function App() {
   const [alertOn, setAlertOn] = useState(true)
   const audioContextRef = useRef<AudioContext | null>(null)
   const autoTradeCandleRef = useRef(0)
+  const accountRequestIdRef = useRef(0)
   const symbolInfo = SYMBOLS.find((item) => item.symbol === symbol) || SYMBOLS[0]
   const settings = paper.settings
   const logEvent = useCallback((source: string, level: ConsoleLevel, message: string) => {
@@ -616,6 +689,10 @@ function App() {
   }, [])
 
   const refreshMarket = useCallback(async (initial = false) => {
+    const scope = `${symbol}:${timeframe}`
+    if (marketRequestInFlightRef.current === scope) return
+    const requestId = ++marketRequestSequenceRef.current
+    marketRequestInFlightRef.current = scope
     if (initial) setMarketLoading(true)
     try {
       const calls = await Promise.all([
@@ -624,23 +701,42 @@ function App() {
         timeframe === '1m' ? Promise.resolve(null) : requestKlines(symbol, '1m', 240),
         requestKlines(symbol, '15m', 120),
       ])
-      setPrice(calls[0].lastPrice)
-      setTicker({ changePct: calls[0].priceChangePercent, high: calls[0].highPrice, low: calls[0].lowPrice, quoteVolume: calls[0].quoteVolume })
-      setCandles(calls[1])
-      setOneMinuteBars(timeframe === '1m' ? calls[1] : calls[2] || [])
-      setFifteenMinuteBars(calls[3])
-      setLastUpdate(Date.now())
+      if (requestId !== marketRequestSequenceRef.current) return
+      const nextTicker = { changePct: calls[0].priceChangePercent, high: calls[0].highPrice, low: calls[0].lowPrice, quoteVolume: calls[0].quoteVolume }
+      setPrice((current) => streamConnectedRef.current && current > 0 ? current : calls[0].lastPrice)
+      setTicker((current) => streamConnectedRef.current && current ? current : nextTicker)
+      setCandles((current) => current.length ? mergeCandle(calls[1], current.slice(-1)) : calls[1])
+      const oneMinuteHistory = timeframe === '1m' ? calls[1] : calls[2] || []
+      setOneMinuteBars((current) => current.length ? mergeCandle(oneMinuteHistory, current.slice(-1)) : oneMinuteHistory)
+      setFifteenMinuteBars((current) => current.length ? mergeCandle(calls[3], current.slice(-1)) : calls[3])
+      const updatedAt = Date.now()
+      lastUpdateRef.current = updatedAt
+      setLastUpdate(updatedAt)
       setMarketError(null)
     } catch (error) {
-      if (!streamConnectedRef.current) setMarketError(error instanceof Error ? error.message : 'Cannot reach Binance market data.')
+      if (requestId === marketRequestSequenceRef.current && !streamConnectedRef.current) setMarketError(error instanceof Error ? error.message : 'Cannot reach Binance market data.')
     } finally {
-      setMarketLoading(false)
+      if (requestId === marketRequestSequenceRef.current) {
+        marketRequestInFlightRef.current = ''
+        setMarketLoading(false)
+      }
     }
   }, [symbol, timeframe])
 
   useEffect(() => {
+    setCandles([])
+    setOneMinuteBars([])
+    setFifteenMinuteBars([])
+    setPrice(0)
+    setTicker(null)
+    setMarketError(null)
+    lastUpdateRef.current = 0
+    setLastUpdate(0)
     void refreshMarket(true)
-    const timer = window.setInterval(() => { void refreshMarket() }, 5000)
+    // WebSocket is the hot path; poll REST only as a low-frequency fallback when the stream is down.
+    const timer = window.setInterval(() => {
+      if (!streamConnectedRef.current) void refreshMarket()
+    }, 15_000)
     return () => window.clearInterval(timer)
   }, [refreshMarket])
 
@@ -648,6 +744,7 @@ function App() {
     let active = true
     let retryDelay = 1000
     let retryTimer: number | undefined
+    let freshnessTimer: number | undefined
     let socket: WebSocket | null = null
     let reportedOffline = false
     const intervals = [...new Set(['1m', '15m', timeframe])]
@@ -676,7 +773,9 @@ function App() {
           if (data.e === '24hrTicker') {
             setPrice(Number(data.c))
             setTicker({ changePct: Number(data.P), high: Number(data.h), low: Number(data.l), quoteVolume: Number(data.q) })
-            setLastUpdate(Date.now())
+            const updatedAt = Date.now()
+            lastUpdateRef.current = updatedAt
+            setLastUpdate(updatedAt)
             setMarketError(null)
           }
           if (data.e === 'kline' && data.k) {
@@ -687,7 +786,9 @@ function App() {
             if (interval === '1m') setOneMinuteBars((current) => mergeCandle(current, [candle]))
             if (interval === '15m') setFifteenMinuteBars((current) => mergeCandle(current, [candle], 120))
             setPrice(candle.close)
-            setLastUpdate(Date.now())
+            const updatedAt = Date.now()
+            lastUpdateRef.current = updatedAt
+            setLastUpdate(updatedAt)
             setMarketError(null)
           }
           setMarketLoading(false)
@@ -714,8 +815,12 @@ function App() {
       retryDelay = Math.min(retryDelay * 2, 30_000)
     }
     connect()
+    freshnessTimer = window.setInterval(() => {
+      if (streamConnectedRef.current && Date.now() - lastUpdateRef.current > 30_000) socket?.close()
+    }, 5_000)
     return () => {
       active = false
+      window.clearInterval(freshnessTimer)
       window.clearTimeout(retryTimer)
       streamConnectedRef.current = false
       socket?.close(1000)
@@ -733,30 +838,41 @@ function App() {
   }, [symbol])
 
   const refreshAccount = useCallback(async () => {
+    const requestId = ++accountRequestIdRef.current
     if (marketMode === 'paper') {
       setAccount(null)
       setAccountError(null)
+      setAccountLoading(false)
       return
     }
     setAccountLoading(true)
-    setAccount(null)
     setAccountError(null)
     try {
       const result = await getJson<AccountResponse>(`/api/account?mode=${marketMode}&market=${marketType}`, {
         headers: accessToken ? { 'X-MBOT-Access-Token': accessToken } : {},
       })
+      if (requestId !== accountRequestIdRef.current) return
       setAccount(result)
       if (!result.configured) setAccountError(result.message || 'Read-only API keys are not configured.')
     } catch (error) {
+      if (requestId !== accountRequestIdRef.current) return
       setAccountError(error instanceof Error ? error.message : 'Unable to read the account.')
     } finally {
-      setAccountLoading(false)
+      if (requestId === accountRequestIdRef.current) setAccountLoading(false)
     }
   }, [marketMode, marketType, accessToken])
 
-  useEffect(() => { void refreshAccount() }, [refreshAccount])
+  const canAutoRefreshAccount = marketMode !== 'paper' && Boolean(accessToken && config?.accountAccessConfigured && (marketMode === 'live' ? config.liveAccountConfigured : config.testnetAccountConfigured))
+  useEffect(() => {
+    setAccount(null)
+    setAccountError(null)
+    void refreshAccount()
+    if (!canAutoRefreshAccount) return
+    const timer = window.setInterval(() => { void refreshAccount() }, 15_000)
+    return () => window.clearInterval(timer)
+  }, [refreshAccount, marketMode, canAutoRefreshAccount])
 
-  const signals: MarketSignals = useMemo(() => calculateSignals(oneMinuteBars, fifteenMinuteBars), [oneMinuteBars, fifteenMinuteBars])
+  const signals: MarketSignals = useMemo(() => calculateSignals(oneMinuteBars, fifteenMinuteBars, settings.entryStrategy), [oneMinuteBars, fifteenMinuteBars, settings.entryStrategy])
   const openPnl = useMemo(() => {
     if (!paper.position || !price) return 0
     const direction = paper.position.side === 'long' ? 1 : -1
@@ -769,17 +885,21 @@ function App() {
       ? paper.position.quantity * price
       : paper.position.margin + (price - paper.position.entry) * paper.position.quantity * (paper.position.side === 'long' ? 1 : -1)
     : 0)
-  const todayResult = dailyPnl(paper.history, openPnl)
+  const todayKey = new Date().toDateString()
+  const todayTrades = useMemo(() => paper.history.filter((trade) => new Date(trade.time).toDateString() === todayKey), [paper.history, todayKey])
+  const todayRealized = useMemo(() => todayTrades.reduce((sum, trade) => sum + trade.pnl, 0), [todayTrades])
+  const todayResult = todayRealized + openPnl
   const todayPercent = paper.startingBalance > 0 ? (todayResult / paper.startingBalance) * 100 : 0
-  const closedToday = paper.history.filter((trade) => new Date(trade.time).toDateString() === new Date().toDateString()).length
-  const streak = getStreak(paper.history)
-  const totalWins = paper.history.filter((trade) => trade.result === 'win').length
+  const closedToday = todayTrades.length
+  const streak = useMemo(() => getStreak(paper.history), [paper.history])
+  const totalWins = useMemo(() => paper.history.filter((trade) => trade.result === 'win').length, [paper.history])
   const winRate = paper.history.length ? (totalWins / paper.history.length) * 100 : 0
   const minNotional = rules?.minNotional || 1
-  const marketSourceReady = Boolean(price && candles.length)
+  const marketDataFresh = Boolean(lastUpdate && Date.now() - lastUpdate <= 30_000)
+  const marketSourceReady = Boolean(price && candles.length && marketDataFresh)
   const dailyLocked = todayPercent <= -settings.dailyStopPct || todayPercent >= settings.dailyTargetPct
   const tradeIntervalMs = settings.tradeIntervalValue * (settings.tradeIntervalUnit === 'seconds' ? 1000 : 60_000)
-  const lastBotTrade = paper.history.find((trade) => trade.source === 'bot')
+  const lastBotTrade = useMemo(() => paper.history.find((trade) => trade.source === 'bot'), [paper.history])
   const cooldownRemainingMs = lastBotTrade ? Math.max(0, lastBotTrade.time + tradeIntervalMs - Date.now()) : 0
   const lossLimitAmount = paper.startingBalance * settings.dailyStopPct / 100
   const targetAmount = paper.startingBalance * settings.dailyTargetPct / 100
@@ -865,8 +985,8 @@ function App() {
     const riskSizedNotional = settings.slPct > 0 ? (equity * settings.riskPct / 100) / (settings.slPct / 100) : settings.baseOrder
     const streakNow = getStreak(paper.history)
     let requested = Math.min(settings.baseOrder, riskSizedNotional)
-    if (settings.strategy === 'martingale') requested = settings.baseOrder * Math.pow(settings.multiplier, streakNow.losses)
-    if (settings.strategy === 'anti') requested = settings.baseOrder * Math.pow(settings.multiplier, streakNow.wins)
+    if (settings.sizingStrategy === 'martingale') requested = settings.baseOrder * Math.pow(settings.multiplier, streakNow.losses)
+    if (settings.sizingStrategy === 'anti') requested = settings.baseOrder * Math.pow(settings.multiplier, streakNow.wins)
     return Math.max(0, Math.min(requested, riskSizedNotional, settings.maxOrder, Math.max(0, paper.cash * 0.9)))
   }, [paper.history, paper.cash, paperEquity, settings])
 
@@ -1085,8 +1205,8 @@ function App() {
   const paperWinRate = `${winRate.toFixed(0)}%`
   const primaryUsdt = marketMode === 'paper' ? paper.cash : (account?.balances.find((asset) => asset.asset === 'USDT')?.free || 0)
   const accountTitle = marketMode === 'paper' ? 'Paper wallet' : marketMode === 'testnet' ? 'Testnet account' : 'Live account'
-  const marketStatus = marketError && !streamConnected ? 'warning' : streamConnected || lastUpdate ? 'online' : 'connecting'
-  const signalDescription = signals.smc === 'bull' ? 'Bullish structure' : signals.smc === 'bear' ? 'Bearish structure' : 'No confluence'
+  const marketStatus = marketSourceReady ? 'online' : marketError ? 'warning' : 'connecting'
+  const signalDescription = signals.autoSide ? `${ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · ${signals.autoSide.toUpperCase()}` : signals.smc === 'bull' ? 'Bullish structure' : signals.smc === 'bear' ? 'Bearish structure' : 'No confluence'
   const riskCap = Math.min(settings.maxOrder, Math.max(0, paper.cash))
   const testnetCap = config?.testnetOrderCapUsdt || 25
   const canTestnetTrade = marketMode === 'testnet' && marketType === 'spot' && Boolean(config?.testnetOrdersEnabled && config.testnetAccountConfigured && config.accountAccessConfigured)
@@ -1094,7 +1214,7 @@ function App() {
   const maxNotionalInfo = rules ? `Exchange minimum ${formatMoney(rules.minNotional)} · step ${formatQuantity(rules.stepSize)}` : 'Exchange filters loading · paper fallback minimum $1'
 
   return (
-    <div className="app-shell">
+    <div className="app-shell terminal-theme">
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark"><Activity size={20} strokeWidth={2.5} /></div>
@@ -1103,7 +1223,7 @@ function App() {
         <div className="topbar-divider" />
         <div className="workspace-label"><span className="workspace-dot" /> Trading workspace <ChevronDown size={13} /></div>
         <div className="topbar-center">
-          <div className={`exchange-status ${marketStatus}`}><span className="status-dot" />{marketError && !streamConnected ? 'Feed issue' : streamConnected ? 'Binance WebSocket live' : lastUpdate ? 'Binance market live' : 'Connecting market'}</div>
+          <div className={`exchange-status ${marketStatus}`}><span className="status-dot" />{marketSourceReady ? streamConnected ? 'Binance WebSocket live' : 'Binance REST fallback' : marketError ? 'Feed issue' : 'Connecting market'}</div>
           <span className="topbar-market">PUBLIC MARKET DATA <span>·</span> READ-ONLY EXCHANGE</span>
         </div>
         <div className="topbar-right">
@@ -1204,7 +1324,7 @@ function App() {
                 timeframe={timeframe}
                 showEma={showEma}
                 showSignals={showSignals}
-                position={paper.position}
+                position={paper.position?.symbol === symbol ? paper.position : null}
                 history={paper.history}
                 price={price}
                 loading={marketLoading}
@@ -1246,7 +1366,8 @@ function App() {
                   </div> : <div className="empty-inline"><Layers3 size={18} /><span>No open paper positions.</span></div>}
                 </div>}
                 {activeTab === 'balances' && <div className="balances-table-area">
-                  {marketMode === 'paper' ? <div className="asset-line"><div className="asset-icon usdt-icon">$</div><div className="asset-name"><strong>USDT</strong><small>Paper quote balance</small></div><div className="asset-amount"><strong>{formatQuantity(paper.cash)}</strong><small>{formatMoney(paper.cash)}</small></div><div className="asset-context">Simulated only</div></div> : accountLoading ? <div className="empty-inline"><RefreshCw size={16} className="spin" /><span>Reading account securely on the server…</span></div> : account?.configured ? account.balances.length ? account.balances.map((balance) => <div className="asset-line" key={balance.asset}><div className="asset-icon asset-generic">{balance.asset.slice(0, 1)}</div><div className="asset-name"><strong>{balance.asset}</strong><small>{marketType === 'futures' ? 'Futures wallet' : 'Spot balance'}</small></div><div className="asset-amount"><strong>{formatQuantity(balance.free + balance.locked)}</strong><small>{formatQuantity(balance.free)} available</small></div><div className="asset-context">Read-only</div></div>) : <div className="empty-inline"><Wallet size={16} /><span>No non-zero assets returned.</span></div> : <div className="empty-inline account-locked"><LockKeyhole size={16} /><span>{accountError || 'Configure read-only API credentials in the server .env.'}</span>{config?.accountAccessConfigured && accountError?.toLowerCase().includes('token') && <button className="auth-link" onClick={() => { setAccessTokenDraft(''); setShowAccessModal(true) }}>Unlock</button>}</div>}
+                  {marketMode === 'paper' ? <div className="asset-line"><div className="asset-icon usdt-icon">$</div><div className="asset-name"><strong>USDT</strong><small>Paper quote balance</small></div><div className="asset-amount"><strong>{formatQuantity(paper.cash)}</strong><small>{formatMoney(paper.cash)}</small></div><div className="asset-context">Simulated only</div></div> : account?.configured ? account.balances.length ? account.balances.map((balance) => <div className="asset-line" key={balance.asset}><div className="asset-icon asset-generic">{balance.asset.slice(0, 1)}</div><div className="asset-name"><strong>{balance.asset}</strong><small>{marketType === 'futures' ? 'Futures wallet' : 'Spot balance'}</small></div><div className="asset-amount"><strong>{formatQuantity(balance.free + balance.locked)}</strong><small>{formatQuantity(balance.free)} available</small></div><div className="asset-context">Read-only</div></div>) : <div className="empty-inline"><Wallet size={16} /><span>No non-zero assets returned.</span></div> : accountLoading ? <div className="empty-inline"><RefreshCw size={16} className="spin" /><span>Reading account securely on the server…</span></div> : <div className="empty-inline account-locked"><LockKeyhole size={16} /><span>{accountError || 'Configure read-only API credentials in the server .env.'}</span>{config?.accountAccessConfigured && accountError?.toLowerCase().includes('token') && <button className="auth-link" onClick={() => { setAccessTokenDraft(''); setShowAccessModal(true) }}>Unlock</button>}</div>}
+                  {marketMode !== 'paper' && account?.configured && <div className="account-refresh-note"><span>{accountLoading ? 'Refreshing' : 'Read-only snapshot'} · {account.updateTime ? `updated ${formatClock(account.updateTime)} UTC` : 'updated automatically'}</span>{accountError && <strong>Refresh issue · showing last successful snapshot</strong>}</div>}
                 </div>}
                 {activeTab === 'console' && <div className="console-terminal">
                   <div className="console-toolbar"><span><i className="console-live-led" /> LOCAL SESSION / {marketMode.toUpperCase()} / {symbol}</span><span>{consoleEvents.length} EVENTS</span></div>
@@ -1271,8 +1392,8 @@ function App() {
 
                 {marketMode === 'live' ? <div className="readonly-notice"><ShieldCheck size={17} /><div><strong>Mainnet is read-only</strong><span>Live balances may be displayed, but this app has no mainnet order route. Switch to Paper or explicitly enable the capped Spot Testnet route.</span></div></div> : marketMode === 'testnet' && !canTestnetTrade ? <div className="readonly-notice"><ShieldCheck size={17} /><div><strong>{marketType === 'futures' ? 'Futures Testnet orders are off' : !config?.testnetOrdersEnabled ? 'Testnet order route is disabled' : !config.testnetAccountConfigured ? 'Fresh Testnet credentials required' : 'Local server access token required'}</strong><span>{marketType === 'futures' ? 'This milestone supports Spot Testnet market orders only. Futures remains read-only.' : !config?.testnetOrdersEnabled ? 'Testnet submission is off by default. Set ENABLE_TESTNET_ORDERS=true on the API server to allow capped manual Spot Testnet orders.' : !config.testnetAccountConfigured ? 'Set fresh Spot Testnet API keys in .env. Never use the exposed keys from chat.' : 'Set MBOT_ACCESS_TOKEN in the API .env, restart the server, then unlock the dashboard tab.'}</span></div></div> : <>
                   <div className="side-selector">
-                    <button className={`side-button buy-side ${marketMode === 'testnet' && testnetSide === 'BUY' ? 'testnet-selected' : ''}`} onClick={() => marketMode === 'testnet' ? setTestnetSide('BUY') : requestManual('long')} disabled={!price || (marketMode === 'paper' && Boolean(paper.position))}><ArrowUpRight size={15} /> {marketMode === 'testnet' ? 'Buy' : marketType === 'spot' ? 'Buy' : 'Long'}</button>
-                    <button className={`side-button sell-side ${marketMode === 'testnet' ? testnetSide === 'SELL' ? 'testnet-selected' : '' : paper.position ? 'close-side' : ''}`} onClick={() => marketMode === 'testnet' ? setTestnetSide('SELL') : paper.position ? requestManual(paper.position.side) : marketType === 'futures' ? requestManual('short') : setToast('Spot cannot open a short. Use Buy to open, then Close position to exit.')} disabled={!price}><ArrowDownRight size={15} /> {marketMode === 'testnet' ? 'Sell' : paper.position ? 'Close position' : marketType === 'spot' ? 'Sell' : 'Short'}</button>
+                    <button className={`side-button buy-side ${marketMode === 'testnet' && testnetSide === 'BUY' ? 'testnet-selected' : ''}`} onClick={() => marketMode === 'testnet' ? setTestnetSide('BUY') : requestManual('long')} disabled={!marketSourceReady || (marketMode === 'paper' && Boolean(paper.position))}><ArrowUpRight size={15} /> {marketMode === 'testnet' ? 'Buy' : marketType === 'spot' ? 'Buy' : 'Long'}</button>
+                    <button className={`side-button sell-side ${marketMode === 'testnet' ? testnetSide === 'SELL' ? 'testnet-selected' : '' : paper.position ? 'close-side' : ''}`} onClick={() => marketMode === 'testnet' ? setTestnetSide('SELL') : paper.position ? requestManual(paper.position.side) : marketType === 'futures' ? requestManual('short') : setToast('Spot cannot open a short. Use Buy to open, then Close position to exit.')} disabled={!marketSourceReady}><ArrowDownRight size={15} /> {marketMode === 'testnet' ? 'Sell' : paper.position ? 'Close position' : marketType === 'spot' ? 'Sell' : 'Short'}</button>
                   </div>
                   <div className="order-field">
                     <div className="field-label-row"><label htmlFor="order-size">Order size</label><span>{marketMode === 'paper' ? <>Available <b>{formatMoney(paper.cash)}</b></> : <>Server cap <b>{formatMoney(testnetCap)}</b></>}</span></div>
@@ -1285,7 +1406,7 @@ function App() {
                     <div><span>{marketMode === 'testnet' ? 'Protective orders' : 'Stop loss / take profit'}</span><strong>{marketMode === 'testnet' ? 'Not attached' : `${settings.slPct}% / ${settings.tpPct}%`}</strong></div>
                   </div>
                   <div className="minimum-info"><Info size={12} /><span>{maxNotionalInfo}</span></div>
-                  <button className={`button primary-order-button ${marketMode === 'testnet' && testnetSide === 'SELL' ? 'testnet-sell-order' : ''} ${marketMode === 'paper' && paper.position ? 'button-muted' : ''}`} onClick={() => marketMode === 'testnet' ? setShowTestnetConfirm(true) : paper.position ? closePosition(paper.position, price, 'Manual close') : openPaperPosition('long', 'manual')} disabled={!price || (marketMode === 'testnet' ? !canTestnetTrade || orderSize < minNotional || orderSize > testnetCap || testnetOrderBusy : !paper.position && orderSize < minNotional)}>
+                  <button className={`button primary-order-button ${marketMode === 'testnet' && testnetSide === 'SELL' ? 'testnet-sell-order' : ''} ${marketMode === 'paper' && paper.position ? 'button-muted' : ''}`} onClick={() => marketMode === 'testnet' ? setShowTestnetConfirm(true) : paper.position ? closePosition(paper.position, price, 'Manual close') : openPaperPosition('long', 'manual')} disabled={!marketSourceReady || (marketMode === 'testnet' ? !canTestnetTrade || orderSize < minNotional || orderSize > testnetCap || testnetOrderBusy : !paper.position && orderSize < minNotional)}>
                     {marketMode === 'testnet' ? <><ShieldCheck size={14} /> Review Testnet {testnetSide}</> : paper.position ? <><Square size={14} fill="currentColor" /> Close paper position</> : <><Plus size={15} /> {marketType === 'spot' ? 'Buy' : 'Open long'} {symbolInfo.base}</>}
                   </button>
                   <div className="paper-order-note"><LockKeyhole size={11} /> {marketMode === 'testnet' ? `Manual Spot Testnet only · hard-capped at ${formatMoney(testnetCap)} · no Mainnet route` : 'Simulated at the current quote · no Binance order is sent'}</div>
@@ -1301,21 +1422,30 @@ function App() {
                     if (marketMode !== 'paper') { setToast('Automatic execution is available in Paper mode only.'); return }
                     if (isRunning) { setIsRunning(false); logEvent('BOT', 'warning', 'Paper strategy paused by operator.'); setToast('Paper bot paused.') }
                     else if (!marketSourceReady) setToast('Wait for market data before starting the paper bot.')
-                    else { prepareAudio(); setIsRunning(true); logEvent('BOT', 'success', `Paper strategy started · ${settings.strategy.toUpperCase()} · ${symbol}.`); setToast('Paper bot started. Trades are simulated only.') }
+                    else { prepareAudio(); setIsRunning(true); logEvent('BOT', 'success', `Paper strategy started · ${settings.entryStrategy.toUpperCase()} / ${settings.sizingStrategy.toUpperCase()} · ${symbol}.`); setToast('Paper bot started. Trades are simulated only.') }
                   }}>
                     {isRunning ? <><Pause size={13} /> Pause</> : <><Play size={13} fill="currentColor" /> Start</>}
                   </button>
                 </div>
-                <div className="strategy-form">
-                  <div className="field-label-row"><label htmlFor="strategy-select">Strategy</label><span className="demo-only-label"><ShieldCheck size={11} /> Paper only</span></div>
-                  <div className="select-wrap"><select id="strategy-select" value={settings.strategy} onChange={(event) => updateSettings({ strategy: event.target.value as Strategy })}>
-                    <option value="smc">SMC confluence · cautious</option><option value="fixed">Fixed size</option><option value="martingale">Martingale · capped demo</option><option value="anti">Anti-martingale · capped demo</option>
+                  <div className="strategy-form">
+                  <div className="field-label-row"><label htmlFor="entry-strategy">Entry strategy</label><span className="demo-only-label"><ShieldCheck size={11} /> Paper only</span></div>
+                  <div className="select-wrap"><select id="entry-strategy" value={settings.entryStrategy} onChange={(event) => updateSettings({ entryStrategy: event.target.value as EntryStrategy })}>
+                    <option value="confluence">SMC confluence · trend + 2 signals</option>
+                    <option value="sweep">Liquidity sweep reversal</option>
+                    <option value="structure">BOS / CHoCH continuation</option>
+                    <option value="orderBlock">Order-block retest</option>
+                    <option value="fvgRetest">Fair-value-gap retest</option>
+                    <option value="trend">15m trend · 2 confirmations</option>
+                  </select><ChevronDown size={13} /></div>
+                  <div className="field-label-row sizing-label-row"><label htmlFor="sizing-strategy">Position sizing</label><span>Demo only</span></div>
+                  <div className="select-wrap"><select id="sizing-strategy" value={settings.sizingStrategy} onChange={(event) => updateSettings({ sizingStrategy: event.target.value as SizingStrategy })}>
+                    <option value="fixed">Fixed risk-sized</option><option value="martingale">Martingale · capped demo</option><option value="anti">Anti-martingale · capped demo</option>
                   </select><ChevronDown size={13} /></div>
                   <div className="two-field-row">
                     <div><label htmlFor="base-order">Base size</label><div className="mini-input"><input id="base-order" type="number" min="1" max="100000" value={settings.baseOrder} onChange={(event) => updateSettings({ baseOrder: Math.max(1, Number(event.target.value)) })} /><span>USDT</span></div></div>
                     <div><label htmlFor="max-order">Max size cap</label><div className="mini-input"><input id="max-order" type="number" min="1" max="100000" value={settings.maxOrder} onChange={(event) => updateSettings({ maxOrder: Math.max(1, Number(event.target.value)) })} /><span>USDT</span></div></div>
                   </div>
-                  {(settings.strategy === 'martingale' || settings.strategy === 'anti') && <div className="two-field-row compact-row">
+                  {(settings.sizingStrategy === 'martingale' || settings.sizingStrategy === 'anti') && <div className="two-field-row compact-row">
                     <div><label htmlFor="multiplier">Step multiplier</label><div className="mini-input"><input id="multiplier" type="number" min="1" max="3" step="0.1" value={settings.multiplier} onChange={(event) => updateSettings({ multiplier: Math.min(3, Math.max(1, Number(event.target.value))) })} /><span>×</span></div></div>
                     <div><label htmlFor="max-losses">Loss stop</label><div className="mini-input"><input id="max-losses" type="number" min="1" max="7" value={settings.maxLosses} onChange={(event) => updateSettings({ maxLosses: Math.min(7, Math.max(1, Number(event.target.value))) })} /><span>losses</span></div></div>
                   </div>}
@@ -1371,18 +1501,24 @@ function App() {
 
               <section className="panel structure-panel">
                 <div className="panel-heading structure-heading"><div><div className="panel-kicker">MARKET STRUCTURE</div><h2>Signal monitor</h2></div><span className="heuristic-tag">HEURISTIC</span></div>
-                <div className="signal-summary"><div className={`signal-icon ${signals.smc}`}><Activity size={17} /></div><div><strong>{signalDescription}</strong><span>15m bias {signals.trend} · {signals.confirmations}/2 candle confirmation</span></div><div className={`signal-pip ${signals.smc}`} /></div>
-                <div className="signal-list">
-                  {(signals.labels.length ? signals.labels.slice(0, 3) : ['Waiting for aligned structure signals']).map((label, index) => <div className="signal-list-item" key={`${label}-${index}`}><span className="signal-check"><Check size={11} /></span><span>{label}</span><small>1m</small></div>)}
+                <div className="signal-summary"><div className={`signal-icon ${signals.smc}`}><Activity size={17} /></div><div><strong>{signalDescription}</strong><span>{ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · 15m bias {signals.trend} · {signals.confirmations}/2 confirmations</span></div><div className={`signal-pip ${signals.smc}`} /></div>
+                <div className="smc-feature-row" aria-label="SMC feature status">
+                  <span className={signals.bos !== 'neutral' ? `active-${signals.bos}` : ''}>BOS</span>
+                  <span className={signals.sweep !== 'neutral' ? `active-${signals.sweep}` : ''}>SWEEP</span>
+                  <span className={signals.orderBlock !== 'neutral' ? `active-${signals.orderBlock}` : ''}>OB RETEST</span>
+                  <span className={signals.fvgRetest !== 'neutral' ? `active-${signals.fvgRetest}` : ''}>FVG RETEST</span>
                 </div>
-                <div className="structure-counts"><div><span className="bull-count">BULLISH</span><strong>{signals.bullCount}</strong></div><div><span className="bear-count">BEARISH</span><strong>{signals.bearCount}</strong></div><div><span>CONFLUENCE</span><strong>{signals.autoSide ? '2+ / OK' : '— / —'}</strong></div></div>
+                <div className="signal-list">
+                  {(signals.labels.length ? signals.labels.slice(0, 3) : [signals.autoSide ? `${ENTRY_STRATEGY_LABELS[settings.entryStrategy]} conditions aligned` : 'Waiting for the selected strategy signal']).map((label, index) => <div className="signal-list-item" key={`${label}-${index}`}><span className="signal-check"><Check size={11} /></span><span>{label}</span><small>1m</small></div>)}
+                </div>
+                <div className="structure-counts"><div><span className="bull-count">BULLISH</span><strong>{signals.bullCount}</strong></div><div><span className="bear-count">BEARISH</span><strong>{signals.bearCount}</strong></div><div><span>ENTRY GATE</span><strong>{signals.autoSide ? 'READY' : 'WAIT'}</strong></div></div>
                 <div className="signal-caveat"><Info size={12} /> Not a prediction. Order blocks, FVGs and sweeps are simplified heuristics.</div>
               </section>
 
               <section className="panel insight-panel">
                 <div className="panel-heading insight-heading"><div className="insight-title"><Sparkles size={15} /><div><div className="panel-kicker">AI COMMENTARY</div><h2>Context, not commands</h2></div></div><span className={`ai-status ${config?.aiConfigured ? 'configured' : ''}`}><span className="status-dot" />{config?.aiConfigured ? 'READY' : 'OPTIONAL'}</span></div>
                 <p>{aiText || 'Optional DeepSeek commentary explains the current signal snapshot. AI never places or approves orders.'}</p>
-                <button className="ai-button" onClick={() => void askAi()} disabled={aiBusy || !price}><Sparkles size={13} /> {aiBusy ? 'Generating…' : 'Explain current setup'} <ArrowUpRight size={13} /></button>
+                <button className="ai-button" onClick={() => void askAi()} disabled={aiBusy || !marketSourceReady}><Sparkles size={13} /> {aiBusy ? 'Generating…' : 'Explain current setup'} <ArrowUpRight size={13} /></button>
               </section>
             </aside>
           </div>

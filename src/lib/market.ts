@@ -10,6 +10,7 @@ export type Candle = {
 
 export type MarketDirection = 'up' | 'down' | 'neutral'
 export type SignalKind = 'bull' | 'bear' | 'neutral'
+export type EntryStrategy = 'confluence' | 'sweep' | 'structure' | 'orderBlock' | 'fvgRetest' | 'trend'
 
 export type MarketSignals = {
   trend: MarketDirection
@@ -17,6 +18,11 @@ export type MarketSignals = {
   smc: SignalKind
   bullCount: number
   bearCount: number
+  bos: SignalKind
+  sweep: SignalKind
+  orderBlock: SignalKind
+  fvg: SignalKind
+  fvgRetest: SignalKind
   labels: string[]
   autoSide: 'long' | 'short' | null
 }
@@ -39,71 +45,159 @@ export function calculateEma(values: number[], period: number): number[] {
   return output
 }
 
-export function calculateSignals(oneMinute: Candle[], fifteenMinute: Candle[]): MarketSignals {
+function kindFrom(bullish: boolean, bearish: boolean): SignalKind {
+  return bullish ? 'bull' : bearish ? 'bear' : 'neutral'
+}
+
+function countSide(features: SignalKind[], side: 'bull' | 'bear') {
+  return features.filter((feature) => feature === side).length
+}
+
+/**
+ * Lightweight, closed-candle SMC heuristics for chart context and paper entries.
+ * These are not validated institutional order-flow rules or a price predictor.
+ */
+export function calculateSignals(oneMinute: Candle[], fifteenMinute: Candle[], strategy: EntryStrategy = 'confluence'): MarketSignals {
   const now = Date.now()
   const closed15m = fifteenMinute.filter((bar) => !bar.closeTime || bar.closeTime < now)
   const closes15m = closed15m.map((bar) => bar.close)
   const ema20 = calculateEma(closes15m, 20)
   const last15m = closed15m.at(-1)
   let trend: MarketDirection = 'neutral'
-  if (last15m && ema20.length) {
+  if (last15m && ema20.length && ema20.at(-1)) {
     const distance = (last15m.close - ema20.at(-1)!) / ema20.at(-1)!
     if (distance > 0.0005) trend = 'up'
     if (distance < -0.0005) trend = 'down'
   }
 
-  const lastTwo = closed15m.slice(-2)
-  const targetDirection = trend === 'up' ? 'up' : trend === 'down' ? 'down' : null
-  const confirmations = targetDirection
-    ? lastTwo.filter((bar) => targetDirection === 'up' ? bar.close > bar.open : bar.close < bar.open).length
-    : 0
+  const lastTwo15m = closed15m.slice(-2)
+  const confirmations = trend === 'up'
+    ? lastTwo15m.filter((bar) => bar.close > bar.open).length
+    : trend === 'down'
+      ? lastTwo15m.filter((bar) => bar.close < bar.open).length
+      : 0
 
   const closed1m = oneMinute.filter((bar) => !bar.closeTime || bar.closeTime < now)
   const current = closed1m.at(-1)
-  const previous = closed1m.slice(-12, -1)
-  let bullCount = 0
-  let bearCount = 0
+  const prior = closed1m.slice(-13, -1)
+  let bos: SignalKind = 'neutral'
+  let sweep: SignalKind = 'neutral'
+  let orderBlock: SignalKind = 'neutral'
+  let fvg: SignalKind = 'neutral'
+  let fvgRetest: SignalKind = 'neutral'
   const labels: string[] = []
 
-  if (current && previous.length >= 4) {
-    const priorHigh = Math.max(...previous.slice(-8).map((bar) => bar.high))
-    const priorLow = Math.min(...previous.slice(-8).map((bar) => bar.low))
-    if (current.close > priorHigh) {
-      bullCount += 1
-      labels.push('BOS ↑')
-      if (previous.slice(-6).some((bar) => bar.close < bar.open)) labels.push('Bullish OB')
-    } else if (current.close < priorLow) {
-      bearCount += 1
-      labels.push('BOS ↓')
-      if (previous.slice(-6).some((bar) => bar.close > bar.open)) labels.push('Bearish OB')
-    }
+  if (current && prior.length >= 8) {
+    const structure = prior.slice(-8)
+    const priorHigh = Math.max(...structure.map((bar) => bar.high))
+    const priorLow = Math.min(...structure.map((bar) => bar.low))
+    const bullishBos = current.close > priorHigh
+    const bearishBos = current.close < priorLow
+    const bullishSweep = current.low < priorLow && current.close > priorLow
+    const bearishSweep = current.high > priorHigh && current.close < priorHigh
+    bos = kindFrom(bullishBos, bearishBos)
+    sweep = kindFrom(bullishSweep, bearishSweep)
+
+    if (bullishBos) labels.push(trend === 'down' ? 'CHoCH ↑' : 'BOS ↑')
+    if (bearishBos) labels.push(trend === 'up' ? 'CHoCH ↓' : 'BOS ↓')
+    if (bullishSweep) labels.push('Low liquidity sweep')
+    if (bearishSweep) labels.push('High liquidity sweep')
+
     const older = closed1m.at(-3)
-    if (older && current.low > older.high) {
-      bullCount += 1
-      labels.push('Bullish FVG')
+    const latestBullGap = Boolean(older && current.low > older.high)
+    const latestBearGap = Boolean(older && current.high < older.low)
+    if (latestBullGap) labels.push('Bullish FVG formed')
+    if (latestBearGap) labels.push('Bearish FVG formed')
+
+    // Search recent, already-formed gaps and check whether the latest closed candle revisited them.
+    for (let index = closed1m.length - 2; index >= Math.max(2, closed1m.length - 18); index -= 1) {
+      const gapBar = closed1m[index]
+      const gapOrigin = closed1m[index - 2]
+      if (!gapBar || !gapOrigin) continue
+      if (gapBar.low > gapOrigin.high) {
+        const zoneLow = gapOrigin.high
+        const zoneHigh = gapBar.low
+        if (current.low <= zoneHigh && current.low >= zoneLow && current.close >= zoneLow) {
+          fvgRetest = 'bull'
+          break
+        }
+      }
+      if (gapBar.high < gapOrigin.low) {
+        const zoneLow = gapBar.high
+        const zoneHigh = gapOrigin.low
+        if (current.high >= zoneLow && current.high <= zoneHigh && current.close <= zoneHigh) {
+          fvgRetest = 'bear'
+          break
+        }
+      }
     }
-    if (older && current.high < older.low) {
-      bearCount += 1
-      labels.push('Bearish FVG')
+    fvg = kindFrom(latestBullGap || fvgRetest === 'bull', latestBearGap || fvgRetest === 'bear')
+    if (fvgRetest === 'bull') labels.push('Bullish FVG retest')
+    if (fvgRetest === 'bear') labels.push('Bearish FVG retest')
+
+    // Find a recent break, then test a revisit to the last opposite candle before that break.
+    const scanStart = Math.max(9, closed1m.length - 24)
+    for (let index = closed1m.length - 2; index >= scanStart; index -= 1) {
+      const breakBar = closed1m[index]
+      const beforeBreak = closed1m.slice(Math.max(0, index - 8), index)
+      if (beforeBreak.length < 5) continue
+      const brokeUp = breakBar.close > Math.max(...beforeBreak.map((bar) => bar.high))
+      const brokeDown = breakBar.close < Math.min(...beforeBreak.map((bar) => bar.low))
+      if (brokeUp) {
+        const block = [...beforeBreak].reverse().find((bar) => bar.close < bar.open)
+        if (block) {
+          const zoneLow = block.low
+          const zoneHigh = Math.max(block.open, block.close)
+          if (current.low <= zoneHigh && current.high >= zoneLow && current.close >= zoneLow && current.close >= current.open) {
+            orderBlock = 'bull'
+          }
+        }
+        if (orderBlock !== 'neutral') break
+      }
+      if (brokeDown) {
+        const block = [...beforeBreak].reverse().find((bar) => bar.close > bar.open)
+        if (block) {
+          const zoneLow = Math.min(block.open, block.close)
+          const zoneHigh = block.high
+          if (current.high >= zoneLow && current.low <= zoneHigh && current.close <= zoneHigh && current.close <= current.open) {
+            orderBlock = 'bear'
+          }
+        }
+        if (orderBlock !== 'neutral') break
+      }
     }
-    if (current.low < priorLow && current.close > priorLow) {
-      bullCount += 1
-      labels.push('Low sweep')
-    }
-    if (current.high > priorHigh && current.close < priorHigh) {
-      bearCount += 1
-      labels.push('High sweep')
-    }
+    if (orderBlock === 'bull') labels.push('Bullish order-block retest')
+    if (orderBlock === 'bear') labels.push('Bearish order-block retest')
   }
 
-  const smc: SignalKind = bullCount > bearCount ? 'bull' : bearCount > bullCount ? 'bear' : 'neutral'
-  const autoSide = confirmations === 2 && bullCount >= 2 && trend === 'up'
-    ? 'long'
-    : confirmations === 2 && bearCount >= 2 && trend === 'down'
-      ? 'short'
-      : null
+  const bullCount = countSide([bos, sweep, orderBlock, fvg], 'bull')
+  const bearCount = countSide([bos, sweep, orderBlock, fvg], 'bear')
+  const smc = kindFrom(bullCount > bearCount, bearCount > bullCount)
+  const biasMatches = (side: 'bull' | 'bear') => side === 'bull' ? trend === 'up' : trend === 'down'
+  const confirmed = (side: 'bull' | 'bear', minimum: number) => biasMatches(side) && confirmations >= minimum
+  let autoSide: 'long' | 'short' | null = null
 
-  return { trend, confirmations, smc, bullCount, bearCount, labels, autoSide }
+  if (strategy === 'confluence') {
+    if (confirmed('bull', 2) && bullCount >= 2) autoSide = 'long'
+    if (confirmed('bear', 2) && bearCount >= 2) autoSide = 'short'
+  } else if (strategy === 'sweep') {
+    if (sweep === 'bull' && confirmed('bull', 1)) autoSide = 'long'
+    if (sweep === 'bear' && confirmed('bear', 1)) autoSide = 'short'
+  } else if (strategy === 'structure') {
+    if (bos === 'bull' && confirmed('bull', 2)) autoSide = 'long'
+    if (bos === 'bear' && confirmed('bear', 2)) autoSide = 'short'
+  } else if (strategy === 'orderBlock') {
+    if (orderBlock === 'bull' && confirmed('bull', 1)) autoSide = 'long'
+    if (orderBlock === 'bear' && confirmed('bear', 1)) autoSide = 'short'
+  } else if (strategy === 'fvgRetest') {
+    if (fvgRetest === 'bull' && confirmed('bull', 1)) autoSide = 'long'
+    if (fvgRetest === 'bear' && confirmed('bear', 1)) autoSide = 'short'
+  } else if (strategy === 'trend') {
+    if (trend === 'up' && confirmations === 2) autoSide = 'long'
+    if (trend === 'down' && confirmations === 2) autoSide = 'short'
+  }
+
+  return { trend, confirmations, smc, bullCount, bearCount, bos, sweep, orderBlock, fvg, fvgRetest, labels, autoSide }
 }
 
 export function getChartMarkers(candles: Candle[]): ChartMarker[] {
