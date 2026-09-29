@@ -362,6 +362,14 @@ h1 { margin: 5px 0 4px; font-size: 22px; line-height: 1.25; letter-spacing: -.68
 .mini-input input { width: 100%; min-width: 0; height: 100%; padding: 0 34px 0 7px; border: 0; outline: 0; background: transparent; color: #cbd6df; font: 9px var(--mono); }
 .mini-input input::-webkit-inner-spin-button { appearance: none; }
 .mini-input span { position: absolute; right: 6px; color: #67798d; font: 7px var(--mono); white-space: nowrap; }
+.trade-interval-input input { padding-right: 42px; }
+.trade-interval-input select { position: absolute; right: 4px; height: 19px; min-width: 38px; padding: 0 3px; border: 0; border-radius: 3px; outline: 0; appearance: none; background: #17222d; color: #8fa0b1; font: 7px var(--mono); text-align: center; cursor: pointer; }
+.cooldown-readout { height: 27px; display: flex; align-items: center; justify-content: space-between; gap: 5px; padding: 0 7px; border: 1px solid rgba(128, 150, 177, .13); border-radius: 4px; background: #0b1119; }
+.cooldown-readout strong { color: #64d6b1; font: 9px var(--mono); }
+.cooldown-readout.waiting strong { color: #e5b868; }
+.cooldown-readout span { overflow: hidden; color: #687a8c; font: 7px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.interval-hint { display: flex; align-items: flex-start; gap: 5px; margin-top: 7px; color: #6a7e91; font-size: 7px; line-height: 1.45; }
+.interval-hint svg { flex: 0 0 auto; color: #7e97ac; }
 .compact-row { margin-top: 7px; }
 .future-warning { display: flex; align-items: center; gap: 5px; margin-top: 16px; color: #daa964; font-size: 8px; }
 .risk-divider { height: 1px; margin: 11px 0 8px; background: rgba(128, 150, 177, .1); }

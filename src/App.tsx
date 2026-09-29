@@ -52,6 +52,7 @@ import { calculateEma, calculateSignals, getChartMarkers, type Candle, type Char
 type TradingMode = 'paper' | 'testnet' | 'live'
 type MarketType = 'spot' | 'futures'
 type Strategy = 'smc' | 'fixed' | 'martingale' | 'anti'
+type TradeIntervalUnit = 'seconds' | 'minutes'
 type TradeSide = 'long' | 'short'
 type Timeframe = '1m' | '5m' | '15m' | '1h'
 type SymbolOption = { symbol: string; base: string; quote: string; name: string }
@@ -89,6 +90,8 @@ type Settings = {
   dailyTargetPct: number
   maxTrades: number
   leverage: number
+  tradeIntervalValue: number
+  tradeIntervalUnit: TradeIntervalUnit
 }
 
 type ClosedTrade = {
@@ -201,6 +204,8 @@ const DEFAULT_SETTINGS: Settings = {
   dailyTargetPct: 2,
   maxTrades: 10,
   leverage: 1,
+  tradeIntervalValue: 1,
+  tradeIntervalUnit: 'minutes',
 }
 const PAPER_STORAGE_KEY = 'mbot-paper-account-v1'
 const TESTNET_ORDERS_STORAGE_KEY = 'mbot-testnet-orders-v1'
@@ -231,6 +236,8 @@ function normalizeSettings(value: Partial<Settings> = {}): Settings {
     dailyTargetPct: clampNumber(merged.dailyTargetPct, 0.1, 20, DEFAULT_SETTINGS.dailyTargetPct),
     maxTrades: Math.round(clampNumber(merged.maxTrades, 1, 100, DEFAULT_SETTINGS.maxTrades)),
     leverage: Math.round(clampNumber(merged.leverage, 1, 3, DEFAULT_SETTINGS.leverage)),
+    tradeIntervalValue: Math.round(clampNumber(merged.tradeIntervalValue, 1, 60, DEFAULT_SETTINGS.tradeIntervalValue)),
+    tradeIntervalUnit: merged.tradeIntervalUnit === 'seconds' ? 'seconds' : 'minutes',
   }
 }
 
@@ -771,6 +778,9 @@ function App() {
   const minNotional = rules?.minNotional || 1
   const marketSourceReady = Boolean(price && candles.length)
   const dailyLocked = todayPercent <= -settings.dailyStopPct || todayPercent >= settings.dailyTargetPct
+  const tradeIntervalMs = settings.tradeIntervalValue * (settings.tradeIntervalUnit === 'seconds' ? 1000 : 60_000)
+  const lastBotTrade = paper.history.find((trade) => trade.source === 'bot')
+  const cooldownRemainingMs = lastBotTrade ? Math.max(0, lastBotTrade.time + tradeIntervalMs - Date.now()) : 0
   const lossLimitAmount = paper.startingBalance * settings.dailyStopPct / 100
   const targetAmount = paper.startingBalance * settings.dailyTargetPct / 100
   const lossRemaining = Math.max(0, lossLimitAmount + todayResult)
@@ -932,13 +942,13 @@ function App() {
       setToast(`${reason} Bot paused for safety.`)
       return
     }
-    if (paper.position || !signals.autoSide || !oneMinuteBars.length) return
+    if (paper.position || cooldownRemainingMs > 0 || !signals.autoSide || !oneMinuteBars.length) return
     const closed = oneMinuteBars.filter((bar) => !bar.closeTime || bar.closeTime < Date.now()).at(-1)
     if (!closed || closed.time === autoTradeCandleRef.current) return
     if (marketType === 'spot' && signals.autoSide === 'short') return
     autoTradeCandleRef.current = closed.time
     openPaperPosition(signals.autoSide, 'bot', autoOrderSize())
-  }, [isRunning, marketMode, dailyLocked, streak.losses, settings.maxLosses, settings.maxTrades, closedToday, paper.position, signals, oneMinuteBars, marketType, openPaperPosition, autoOrderSize, logEvent])
+  }, [isRunning, marketMode, dailyLocked, streak.losses, settings.maxLosses, settings.maxTrades, closedToday, paper.position, signals, oneMinuteBars, marketType, openPaperPosition, autoOrderSize, cooldownRemainingMs, logEvent])
 
   useEffect(() => {
     if (!toast) return
@@ -1327,6 +1337,25 @@ function App() {
                     <div><label htmlFor="risk-pct">Risk budget</label><div className="mini-input"><input id="risk-pct" type="number" min="0.1" max="2" step="0.1" value={settings.riskPct} onChange={(event) => updateSettings({ riskPct: Math.min(2, Math.max(0.1, Number(event.target.value))) })} /><span>% / trade</span></div></div>
                     <div><label htmlFor="max-trades">Trade limit</label><div className="mini-input"><input id="max-trades" type="number" min="1" max="100" value={settings.maxTrades} onChange={(event) => updateSettings({ maxTrades: Math.max(1, Number(event.target.value)) })} /><span>/ day</span></div></div>
                   </div>
+                  <div className="two-field-row compact-row trade-cooldown-row">
+                    <div>
+                      <label htmlFor="trade-interval-value">Time between bot trades</label>
+                      <div className="mini-input trade-interval-input">
+                        <input id="trade-interval-value" type="number" min="1" max="60" step="1" value={settings.tradeIntervalValue} onChange={(event) => updateSettings({ tradeIntervalValue: Math.round(Number(event.target.value)) })} />
+                        <select aria-label="Trade interval unit" value={settings.tradeIntervalUnit} onChange={(event) => updateSettings({ tradeIntervalUnit: event.target.value as TradeIntervalUnit })}>
+                          <option value="seconds">sec</option><option value="minutes">min</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div>
+                      <label>Next bot entry</label>
+                      <div className={`cooldown-readout ${cooldownRemainingMs > 0 ? 'waiting' : 'ready'}`}>
+                        <strong>{cooldownRemainingMs > 0 ? formatDuration(Math.ceil(cooldownRemainingMs / 1000) * 1000) : 'READY'}</strong>
+                        <span>{lastBotTrade ? cooldownRemainingMs > 0 ? 'after last bot exit' : 'interval elapsed' : 'no prior bot trade'}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="interval-hint"><Info size={11} /> Minimum wait after the previous bot trade closes. A valid signal is still required; this does not force an entry.</div>
                   <div className="circuit-distance">
                     <div className="distance-item"><div><span>TO DAILY STOP</span><strong>{formatMoney(lossRemaining)}</strong></div><div className="distance-track"><i className="loss-fill" style={{ width: `${lossProgress}%` }} /></div></div>
                     <div className="distance-item"><div><span>TO DAILY TARGET</span><strong>{formatMoney(targetRemaining)}</strong></div><div className="distance-track"><i className="target-fill" style={{ width: `${targetProgress}%` }} /></div></div>
@@ -1358,7 +1387,7 @@ function App() {
             </aside>
           </div>
 
-          <footer className="page-footer"><span>MBOT <b>0.1.0</b> <span className="footer-dot">·</span> Market feed {lastUpdate ? `updated ${formatClock(lastUpdate)} UTC` : 'connecting'}</span><span><ShieldCheck size={12} /> No exchange order execution enabled in this build</span><a href="https://www.binance.com/en/terms" target="_blank" rel="noreferrer">Exchange terms <ExternalLink size={11} /></a></footer>
+          <footer className="page-footer"><span>MBOT <b>0.1.0</b> <span className="footer-dot">·</span> Market feed {lastUpdate ? `updated ${formatClock(lastUpdate)} UTC` : 'connecting'}</span><span><ShieldCheck size={12} /> Mainnet off · Spot Testnet manual and gated</span><a href="https://www.binance.com/en/terms" target="_blank" rel="noreferrer">Exchange terms <ExternalLink size={11} /></a></footer>
         </main>
       </div>
 

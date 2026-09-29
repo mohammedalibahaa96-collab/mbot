@@ -13,7 +13,7 @@ Secrets belong in a server-side `.env` file on the computer running the API. The
 - Live Binance public ticker and candlesticks for SHIB, BTC, ETH, SOL, BNB, and DGB against USDT; selectable 1m, 5m, 15m, and 1h chart intervals.
 - Candlestick chart with EMA 20 and simplified BOS/FVG/liquidity-sweep markers. These are educational heuristics, not validated SMC detection or predictions.
 - 15-minute bias and two-candle confirmation monitor.
-- Local paper wallet with editable starting USDT balance, simulated spot/futures positions, basic fees, stop-loss/take-profit monitoring, trade history with per-trade time, CSV export, and capped strategy controls.
+- Local paper wallet with editable starting USDT balance, simulated spot/futures positions, basic fees, stop-loss/take-profit monitoring, trade history with per-trade time, configurable bot trade cooldown (1–60 seconds/minutes), CSV export, and capped strategy controls.
 - Terminal-style runtime console for feed connection/retry, paper entries/exits, bot controls, safety pauses, and Testnet order results.
 - Optional server-side, advisory-only OpenRouter/DeepSeek commentary. It cannot submit an order.
 - Optional read-only live/testnet account balance display, if configured on the server.
