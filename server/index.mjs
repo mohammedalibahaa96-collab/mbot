@@ -4,6 +4,7 @@ import express from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { registerTestnetOrderRoute } from './testnet-orders.mjs'
+import { buildProjectZip, packageEtag, packageFileName } from './package-download.mjs'
 
 const app = express()
 const PORT = Number(process.env.PORT || 3001)
@@ -258,8 +259,46 @@ app.post('/api/ai/insight', async (req, res, next) => {
 })
 
 // Mainnet order placement is never exposed. The isolated Spot Testnet route is manually gated and capped.
+
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+let cachedPackage = null
+
+/**
+ * Hands the user a ready-to-run copy of the project. Local callers (the Vite
+ * dev proxy, `npm start`, a browser on the same machine) are allowed without a
+ * token; anything else must present the dashboard token. The archive never
+ * contains `.env`, `.git` or `node_modules`.
+ */
+app.get('/api/package', async (req, res, next) => {
+  try {
+    if (!LOOPBACK.has(req.ip) && !hasValidLocalToken(req)) {
+      return res.status(401).json({ error: 'Downloading the project requires a local request or the dashboard access token.' })
+    }
+    if (!cachedPackage || Date.now() - cachedPackage.builtAt > 60_000) {
+      const built = await buildProjectZip(ROOT)
+      cachedPackage = { ...built, builtAt: Date.now() }
+    }
+    const fileName = packageFileName(process.env.npm_package_version)
+    const etag = packageEtag(cachedPackage.buffer)
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
+    res.setHeader('Content-Length', String(cachedPackage.buffer.length))
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('X-MBOT-Package-Files', String(cachedPackage.fileCount))
+    if (req.get('If-None-Match') === etag) return res.status(304).end()
+    res.setHeader('ETag', etag)
+    res.end(cachedPackage.buffer)
+  } catch (error) {
+    next(error)
+  }
+})
+
 if (IS_PRODUCTION) {
   app.use(express.static(path.join(ROOT, 'dist'), { index: false, maxAge: '1h' }))
+  // An unknown /api path must stay a JSON 404. Without this the SPA catch-all
+  // below would answer it with index.html and a 200, so the client would try to
+  // parse HTML as JSON and fail silently instead of seeing a real error.
+  app.use('/api', (_req, res) => res.status(404).json({ error: 'Unknown API route.' }))
   app.get('*', (_req, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')))
 }
 

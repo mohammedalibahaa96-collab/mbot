@@ -48,6 +48,8 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { calculateEma, calculateRiskSizedNotional, calculateSignals, detectTrianglePattern, floorQuantityToStep, getAtrExitPrices, getChartMarkers, getChartZones, DEFAULT_CHART_LAYERS, type Candle, type ChartLayer, type ChartLayerVisibility, type ChartMarker, type EntryStrategy, type MarketSignals, type TrianglePattern } from './lib/market'
+import { analyzeSmc, formatLevel, type SmcAnalysis } from './lib/smc'
+import { DEFAULT_OVERLAY_LAYERS, SmcOverlay, type ChartHandle, type OverlayLayers } from './components/SmcOverlay'
 
 type TradingMode = 'paper' | 'testnet' | 'live'
 type MarketType = 'spot' | 'futures'
@@ -200,6 +202,17 @@ const CHART_LAYER_OPTIONS: Array<{ key: ChartLayer; label: string; title: string
   { key: 'fvg', label: 'FVG', title: 'Toggle fair-value-gap markers and zone rails' },
   { key: 'sweep', label: 'SWEEP', title: 'Toggle liquidity-sweep markers' },
   { key: 'triangle', label: 'TRI', title: 'Toggle triangle pattern rails' },
+]
+const OVERLAY_LAYER_OPTIONS: Array<{ key: keyof OverlayLayers; label: string; title: string }> = [
+  { key: 'structure', label: 'BOS', title: 'Break of structure and change of character lines' },
+  { key: 'orderBlocks', label: 'OB', title: 'Order blocks with mitigation state and A/B/C grade' },
+  { key: 'fvg', label: 'FVG', title: 'Fair value gaps with open / partial / filled state' },
+  { key: 'liquidity', label: 'LIQ', title: 'Unswept buy-side and sell-side liquidity pools' },
+  { key: 'sweeps', label: 'SWEEP', title: 'Liquidity sweeps that took a pool' },
+  { key: 'patterns', label: 'PAT', title: 'Triangles, wedges, channels, ranges and double tops / bottoms' },
+  { key: 'premium', label: 'PREM', title: 'Dealing range with premium / discount and equilibrium' },
+  { key: 'projection', label: 'PATH', title: 'Scenario path toward the next liquidity pool' },
+  { key: 'verdict', label: 'PLAN', title: 'Verdict zone with stop loss and take-profit levels' },
 ]
 const ENTRY_STRATEGY_LABELS: Record<EntryStrategy, string> = {
   confluence: 'SMC confluence',
@@ -437,6 +450,8 @@ function ChartPanel({
   timeframe,
   showEma,
   layers,
+  overlayLayers,
+  analysis,
   position,
   history,
   price,
@@ -445,12 +460,15 @@ function ChartPanel({
   streamConnected,
   onToggleEma,
   onToggleLayer,
+  onToggleOverlayLayer,
 }: {
   candles: Candle[]
   symbol: string
   timeframe: string
   showEma: boolean
   layers: ChartLayerVisibility
+  overlayLayers: OverlayLayers
+  analysis: SmcAnalysis | null
   position: OpenPosition | null
   history: ClosedTrade[]
   price: number
@@ -459,9 +477,13 @@ function ChartPanel({
   streamConnected: boolean
   onToggleEma: () => void
   onToggleLayer: (layer: ChartLayer) => void
+  onToggleOverlayLayer: (layer: keyof OverlayLayers) => void
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<IChartApi | null>(null)
+  // Held in state, not a ref: the overlay is a child effect and would otherwise
+  // mount before the chart exists and never attach to it.
+  const [overlayHandle, setOverlayHandle] = useState<ChartHandle | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   const emaSeriesRef = useRef<ISeriesApi<'Line'> | null>(null)
   const overlaySeriesRef = useRef<Record<'triangleTop' | 'triangleBottom' | 'obTop' | 'obBottom' | 'fvgTop' | 'fvgBottom', ISeriesApi<'Line'> | null>>({ triangleTop: null, triangleBottom: null, obTop: null, obBottom: null, fvgTop: null, fvgBottom: null })
@@ -517,6 +539,7 @@ function ChartPanel({
     const addOverlayLine = (color: string) => chart.addLineSeries({ color, lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false })
     chartRef.current = chart
     candleSeriesRef.current = candlesSeries
+    setOverlayHandle({ chart, series: candlesSeries })
     emaSeriesRef.current = emaSeries
     overlaySeriesRef.current = {
       triangleTop: addOverlayLine('#deb45e'),
@@ -537,6 +560,7 @@ function ChartPanel({
       resizeObserver.disconnect()
       chart.remove()
       chartRef.current = null
+      setOverlayHandle(null)
       candleSeriesRef.current = null
       emaSeriesRef.current = null
       overlaySeriesRef.current = { triangleTop: null, triangleBottom: null, obTop: null, obBottom: null, fvgTop: null, fvgBottom: null }
@@ -662,23 +686,43 @@ function ChartPanel({
           <button className={`tool-button ${showEma ? 'is-active' : ''}`} onClick={onToggleEma} title="Toggle EMA 20"><span className="legend-line ema-line" /> EMA 20</button>
           <button className="icon-button" onClick={() => setFull((value) => !value)} title={full ? 'Restore chart' : 'Expand chart'}><Maximize2 size={15} /></button>
         </div>
-        <div className="chart-layer-row" aria-label="Chart indicator layers">
-          <span className="chart-layer-label">LAYERS</span>
+        <div className="chart-layer-row" aria-label="Smart Money Concepts drawing layers">
+          <span className="chart-layer-label">SMC</span>
+          {OVERLAY_LAYER_OPTIONS.map(({ key, label, title }) => <button key={key} type="button" className={`layer-chip ${overlayLayers[key] ? 'active' : ''}`} aria-pressed={overlayLayers[key]} title={title} onClick={() => onToggleOverlayLayer(key)}>{label}<i /></button>)}
+          <button type="button" className={`layer-chip ${showEma ? 'active' : ''}`} aria-pressed={showEma} title="Toggle EMA 20 overlay" onClick={onToggleEma}>EMA20<i /></button>
+        </div>
+        <div className="chart-layer-row" aria-label="Legacy chart marker layers">
+          <span className="chart-layer-label">MARK</span>
           {CHART_LAYER_OPTIONS.map(({ key, label, title }) => <button key={key} type="button" className={`layer-chip ${layers[key] ? 'active' : ''}`} aria-pressed={layers[key]} title={title} onClick={() => onToggleLayer(key)}>{label}<i /></button>)}
           {layers.triangle && trianglePattern && <span className="triangle-readout">{trianglePattern.kind.toUpperCase()} TRIANGLE{trianglePattern.breakout !== 'neutral' ? ` · BREAK ${trianglePattern.breakout.toUpperCase()}` : ''}</span>}
+          {analysis && analysis.patterns[0] && <span className="triangle-readout">{analysis.patterns[0].label} · Q{analysis.patterns[0].quality.toFixed(2)} · BIAS {analysis.patterns[0].bias.toUpperCase()}</span>}
         </div>
       </div>
       <div className="chart-price-strip">
         <div className="chart-last-price">{formatPrice(price)} <span>USDT</span></div>
         <div className="chart-high-low"><span><small>H</small> {chartRange ? formatPrice(chartRange.high) : '—'}</span><span><small>L</small> {chartRange ? formatPrice(chartRange.low) : '—'}</span></div>
+        {analysis && <div className="chart-verdict-strip"><span className={`verdict-tag ${verdictTone(analysis.verdict.stance)}`}>{analysis.verdict.headline}</span><span className="verdict-score">SCORE {analysis.verdict.score}</span>{analysis.verdict.riskReward && <span className="verdict-score">R:R {analysis.verdict.riskReward.toFixed(2)}</span>}</div>}
       </div>
       <div className="chart-wrap" ref={containerRef}>
         {!candles.length && <div className="chart-empty"><div className="empty-orbit"><Activity size={20} /></div><strong>{loading ? 'Connecting to Binance market data' : 'Market feed unavailable'}</strong><span>{error || 'Waiting for the public candle feed…'}</span></div>}
         {candles.length > 0 && error && <div className="chart-error-pill"><AlertTriangle size={12} /> Stale feed · retrying</div>}
+        <SmcOverlay
+          handle={overlayHandle}
+          analysis={analysis}
+          layers={overlayLayers}
+          position={position && position.symbol === symbol ? { side: position.side, entry: position.entry, stopLoss: position.stopLoss, takeProfit: position.takeProfit } : null}
+        />
       </div>
-      <div className="chart-footnote"><span><span className="foot-dot teal" /> Green candles close higher</span><span><span className="foot-dot red" /> Red candles close lower</span><span className="footnote-risk"><Info size={12} /> SMC drawings are heuristic examples, not trade guarantees</span></div>
+      <div className="chart-footnote"><span><span className="foot-dot teal" /> Green candles close higher</span><span><span className="foot-dot red" /> Red candles close lower</span><span className="footnote-risk"><Info size={12} /> Drawings are rule-based readings of closed candles, not trade guarantees</span></div>
     </section>
   )
+}
+
+function verdictTone(stance: SmcAnalysis['verdict']['stance']) {
+  if (stance === 'buyNow') return 'buy'
+  if (stance === 'sellNow') return 'sell'
+  if (stance === 'waitConfirm' || stance === 'waitRetrace') return 'wait'
+  return 'none'
 }
 
 function App() {
@@ -720,6 +764,7 @@ function App() {
   const [accountLoading, setAccountLoading] = useState(false)
   const [accountError, setAccountError] = useState<string | null>(null)
   const [chartLayers, setChartLayers] = useState<ChartLayerVisibility>(() => ({ ...DEFAULT_CHART_LAYERS }))
+  const [overlayLayers, setOverlayLayers] = useState<OverlayLayers>(() => ({ ...DEFAULT_OVERLAY_LAYERS }))
   const [showEma, setShowEma] = useState(true)
   const [orderSize, setOrderSize] = useState(10)
   const [isRunning, setIsRunning] = useState(false)
@@ -734,6 +779,7 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [alertOn, setAlertOn] = useState(true)
+  const [packageBusy, setPackageBusy] = useState(false)
   const audioContextRef = useRef<AudioContext | null>(null)
   const autoTradeCandleRef = useRef(0)
   const accountRequestIdRef = useRef(0)
@@ -742,6 +788,36 @@ function App() {
   const logEvent = useCallback((source: string, level: ConsoleLevel, message: string) => {
     setConsoleEvents((current) => [{ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, time: Date.now(), level, source, message }, ...current].slice(0, 100))
   }, [])
+
+  const downloadPackage = useCallback(async () => {
+    setPackageBusy(true)
+    logEvent('PACKAGE', 'info', 'Building project archive…')
+    try {
+      const response = await fetch('/api/package', { headers: accessToken ? { 'X-MBOT-Access-Token': accessToken } : {} })
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null)
+        throw new Error(detail?.error || `Download failed (${response.status}).`)
+      }
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      const name = /filename="([^"]+)"/.exec(response.headers.get('Content-Disposition') || '')?.[1] || 'mbot-terminal.zip'
+      anchor.href = url
+      anchor.download = name
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      logEvent('PACKAGE', 'success', `Archive ${name} downloaded. Extract it, run the launcher, done.`)
+      setToast('Project archive downloaded. Extract it and run start-windows.bat or start-mac-linux.sh.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Download failed.'
+      logEvent('PACKAGE', 'error', message)
+      setToast(message)
+    } finally {
+      setPackageBusy(false)
+    }
+  }, [accessToken, logEvent])
 
   useEffect(() => {
     try { localStorage.setItem(PAPER_STORAGE_KEY, JSON.stringify(paper)) } catch { /* private browsing may block storage */ }
@@ -942,6 +1018,12 @@ function App() {
   }, [refreshAccount, marketMode, canAutoRefreshAccount])
 
   const signals: MarketSignals = useMemo(() => calculateSignals(oneMinuteBars, fifteenMinuteBars, settings.entryStrategy), [oneMinuteBars, fifteenMinuteBars, settings.entryStrategy])
+  // The SMC engine is ~1ms for 320 bars, so it can safely follow the live candle.
+  const htfBias = signals.trend === 'up' ? 'up' : signals.trend === 'down' ? 'down' : 'flat'
+  const analysis = useMemo(
+    () => (candles.length >= 30 ? analyzeSmc(candles, {}, htfBias) : null),
+    [candles, htfBias],
+  )
   const openPnl = useMemo(() => {
     if (!paper.position || !price) return 0
     const direction = paper.position.side === 'long' ? 1 : -1
@@ -1406,6 +1488,8 @@ function App() {
                 timeframe={timeframe}
                 showEma={showEma}
                 layers={chartLayers}
+                overlayLayers={overlayLayers}
+                analysis={analysis}
                 position={paper.position?.symbol === symbol ? paper.position : null}
                 history={paper.history}
                 price={price}
@@ -1414,6 +1498,7 @@ function App() {
                 streamConnected={streamConnected}
                 onToggleEma={() => setShowEma((value) => !value)}
                 onToggleLayer={(layer) => setChartLayers((current) => ({ ...current, [layer]: !current[layer] }))}
+                onToggleOverlayLayer={(layer) => setOverlayLayers((current) => ({ ...current, [layer]: !current[layer] }))}
               />
 
               <section className="panel activity-panel">
@@ -1590,6 +1675,34 @@ function App() {
               </section>
 
               <section className="panel structure-panel">
+                <div className="panel-heading structure-heading"><div><div className="panel-kicker">SMC VERDICT</div><h2>Where to act</h2></div><span className="heuristic-tag">RULE BASED</span></div>
+                {!analysis ? (
+                  <div className="empty-table"><div className="empty-table-icon"><Activity size={18} /></div><strong>Warming up</strong><span className="empty-inline">The SMC engine needs 30 closed candles before it will call a level.</span></div>
+                ) : (
+                  <>
+                    <div className="verdict-block">
+                      <div className={`verdict-tag big ${verdictTone(analysis.verdict.stance)}`}>{analysis.verdict.headline}</div>
+                      <p className="verdict-directive">{analysis.verdict.directive}</p>
+                      <div className="verdict-levels">
+                        <div><span>ZONE</span><strong>{analysis.verdict.entryLow !== null && analysis.verdict.entryHigh !== null ? `${formatLevel(analysis.verdict.entryLow)} – ${formatLevel(analysis.verdict.entryHigh)}` : '—'}</strong></div>
+                        <div><span>STOP</span><strong className="value-negative">{analysis.verdict.stop !== null ? formatLevel(analysis.verdict.stop) : '—'}</strong></div>
+                        <div><span>SCORE</span><strong>{analysis.verdict.score}/100</strong></div>
+                        <div><span>R:R</span><strong>{analysis.verdict.riskReward ? `${analysis.verdict.riskReward.toFixed(2)} : 1` : '—'}</strong></div>
+                      </div>
+                      {analysis.verdict.targets.length > 0 && <div className="verdict-targets">{analysis.verdict.targets.map((target, index) => <span key={`${target.price}-${index}`} className="verdict-target"><b>TP{index + 1}</b> {formatLevel(target.price)} <i>{target.label}</i></span>)}</div>}
+                      <div className="verdict-scorebar"><i style={{ width: `${analysis.verdict.score}%` }} /></div>
+                    </div>
+                    <ul className="verdict-checks">
+                      {analysis.verdict.checks.map((check) => <li key={check.label} className={check.state}><i />{check.label}</li>)}
+                    </ul>
+                    <div className="verdict-invalidation"><AlertTriangle size={12} /> {analysis.verdict.invalidation}</div>
+                    <div className="signal-list">{analysis.verdict.reasons.map((reason, index) => <div className="signal-list-item" key={`${reason}-${index}`}><span>{reason}</span></div>)}</div>
+                    {analysis.projection.path.length > 1 && <div className="projection-note"><Layers3 size={12} /> <span><b>SCENARIO PATH</b> {analysis.projection.side?.toUpperCase()} · {analysis.projection.targetLabel} · confidence {analysis.projection.confidence}%. {analysis.projection.note}</span></div>}
+                  </>
+                )}
+              </section>
+
+              <section className="panel structure-panel">
                 <div className="panel-heading structure-heading"><div><div className="panel-kicker">MARKET STRUCTURE</div><h2>Signal monitor</h2></div><span className="heuristic-tag">HEURISTIC</span></div>
                 <div className="signal-summary"><div className={`signal-icon ${signals.smc}`}><Activity size={17} /></div><div><strong>{signalDescription}</strong><span>{ENTRY_STRATEGY_LABELS[settings.entryStrategy]} · 15m bias {signals.trend} · {settings.entryStrategy === 'scalp' ? `${signals.confirmations} confirming 15m bars (1+ required)` : `${signals.confirmations}/2 confirmations`}</span></div><div className={`signal-pip ${signals.smc}`} /></div>
                 {settings.entryStrategy === 'scalp' && <div className="scalp-diagnostics" aria-label="Scalping signal diagnostics">
@@ -1623,7 +1736,14 @@ function App() {
             </aside>
           </div>
 
-          <footer className="page-footer"><span>MBOT <b>0.1.0</b> <span className="footer-dot">·</span> Market feed {lastUpdate ? `updated ${formatClock(lastUpdate)} UTC` : 'connecting'}</span><span><ShieldCheck size={12} /> Mainnet off · Spot Testnet manual and gated</span><a href="https://www.binance.com/en/terms" target="_blank" rel="noreferrer">Exchange terms <ExternalLink size={11} /></a></footer>
+          <footer className="page-footer">
+            <span>MBOT <b>0.1.0</b> <span className="footer-dot">·</span> Market feed {lastUpdate ? `updated ${formatClock(lastUpdate)} UTC` : 'connecting'}</span>
+            <span><ShieldCheck size={12} /> Mainnet off · Spot Testnet manual and gated</span>
+            <button className="button button-outline download-button" onClick={() => void downloadPackage()} disabled={packageBusy} title="Download a ready-to-run copy of this project as a ZIP">
+              <FileDown size={12} /> {packageBusy ? 'Building…' : 'Download project .zip'}
+            </button>
+            <a href="https://www.binance.com/en/terms" target="_blank" rel="noreferrer">Exchange terms <ExternalLink size={11} /></a>
+          </footer>
         </main>
       </div>
 

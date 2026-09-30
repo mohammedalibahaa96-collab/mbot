@@ -1,83 +1,287 @@
 # MBOT Trading Terminal
 
-A paper-first desktop-style trading dashboard with live public Binance spot market data. The current build is intentionally a **monitoring and simulation prototype**, not an autonomous live trading system.
+A local, single-user trading dashboard. It reads live public Binance spot data,
+draws Smart Money Concepts structure on the chart, and simulates execution in a
+paper wallet you control.
 
-## Security first
+**This is a paper-first monitoring and simulation tool. It is not an autonomous
+live trading system, and it cannot make money for you.**
 
-API credentials were exposed in the project request. Treat the Binance live, Binance testnet, and OpenRouter keys as compromised: revoke/rotate them in their provider dashboards before using this project. Do not reuse the pasted values. Never enable withdrawals on a Binance API key. Mainnet account keys should remain read-only. Testnet trade permission, if deliberately enabled, must belong to a fresh Testnet-only key and cannot access real funds.
+---
 
-Secrets belong in a server-side `.env` file on the computer running the API. They are never embedded into Vite/browser code and the API only reports whether credentials are configured. `.env` is git-ignored.
+## Read this first
 
-## What is implemented
+### Your API keys were exposed
 
-- Binance public ticker/candlestick feed for SHIB, BTC, ETH, SOL, BNB, and DGB against USDT; selectable 1m, 5m, 15m, and 1h intervals. WebSocket is the live path, reconnects with backoff, and REST polling backs it up every 15 seconds when disconnected. The UI shows feed status and freshness.
-- A compact terminal theme and incremental chart updates for live candles; account balances refresh automatically every 15 seconds and retain the last successful snapshot during refresh.
-- EMA 20 plus independent chart-layer toggles for BOS/CHoCH, order blocks, FVGs, liquidity sweeps, and triangles. OB/FVG zones render as bounded chart rails; ascending, descending, and symmetrical triangle candidates draw two fitted rails and a breakout marker. This is simplified pivot-based technical analysis—not exact or guaranteed pattern recognition, and it can produce false positives.
-- Seven selectable Paper entry rules: SMC confluence, liquidity-sweep reversal, BOS/CHoCH continuation, order-block retest, FVG retest, 15-minute trend with two candle confirmations, and a filtered 1-minute scalp setup. The scalp heuristic looks for an EMA 9/21 pullback and reclaim, an RSI band, minimum relative volume, a bounded ATR/price range, candle strength, limited EMA extension, and 15-minute directional context. It uses closed candles and displays RSI, ATR, volume, and per-filter readiness; bot scalp exits and risk sizing use configurable ATR multiples. Manual paper orders retain percentage stops. These are unvalidated heuristics; the scalper and readiness display do not identify the “best” trade or predict profitability.
-- Local paper wallet with editable starting USDT balance, simulated spot/futures positions, basic fees, available exchange minimum-notional/quantity-step filters, stop-loss/take-profit monitoring, trade history with per-trade time, configurable bot trade cooldown (1–60 seconds/minutes), CSV export, and capped strategy controls.
-- Terminal-style runtime console for feed connection/retry, paper entries/exits, bot controls, safety pauses, and Testnet order results.
-- Optional server-side, advisory-only OpenRouter/DeepSeek commentary. It cannot submit an order.
-- Optional read-only live/testnet account balance display, if configured on the server.
-- Optional **manual Spot Testnet-only** market orders behind an explicit server flag, local access token, hard per-order cap, and a confirmation dialog. Disabled by default; no automated testnet orders.
+Binance live keys, Binance Testnet keys, and an OpenRouter key were pasted into
+a chat. **Treat all of them as permanently compromised.**
 
-## Explicitly not implemented
+1. Go to <https://www.binance.com/en/my/settings/api-management>
+2. Delete every key that was shared.
+3. Create new keys. Never reuse a shared one.
+4. Do the same for <https://openrouter.ai/keys>.
 
-- No Binance Mainnet order-placement endpoint and no autonomous real-money trading.
-- Live account mode is read-only. Testnet order submission is Spot-only, manual, optional, and disabled unless explicitly enabled in the server `.env`; Binance Futures Testnet orders are not implemented.
-- No guarantee of profitability, predictive AI, or reliable identification of every order block/FVG/triangle.
-- The futures selector only changes the **paper simulation**. It does not connect to Binance Futures or model funding, liquidation, slippage, or all exchange rules.
-- AI commentary is not MCP and cannot control the bot. It is optional natural-language context only.
+Nothing in this repository contains those keys, and the download feature
+deliberately excludes `.env` from every archive it produces. But rotating the
+keys is the only real fix — a leaked secret cannot be un-leaked.
 
-## Run locally
+### What this tool will not do
 
-Requirements: Node.js 20+ and npm. A typical always-on PC is sufficient for this dashboard; live trading uptime and risk are separate concerns. A VPS, UPS, or faster PC cannot make a strategy profitable or prevent exchange/network failures.
+| Requested | Reality |
+| --- | --- |
+| 25% profit every day | Not achievable, not by this or any other software. Fees, spread, slippage, and latency all work against short-timeframe systems. |
+| Never lose 10–11 times in a row | No rule, confirmation filter, or AI can prevent a losing streak. Martingale *causes* them. |
+| AI that predicts the market | No model forecasts price. The AI panel here writes commentary; it cannot place an order. |
+| A guaranteed profit | No such thing exists. Anyone promising one is running a scam. |
+| Auto-trading real Binance money with martingale | Not implemented, deliberately. An automatic martingale against a real balance destroys accounts. |
+
+The risk controls in this app (daily stop, trade cap, loss-run limit, order cap)
+**limit** the damage from a losing run. They do not remove it.
+
+---
+
+## Run it
+
+Requirements: **Node.js 20 or newer** and npm. A normal PC is enough; a faster
+PC or a VPS will not make a strategy profitable.
 
 ```bash
 npm install
-cp .env.example .env
+cp .env.example .env      # Windows: copy .env.example .env
 npm run dev
 ```
 
-Open the Vite URL shown by the terminal (normally `http://localhost:5173`). The API runs on port 3001. In development, Vite proxies `/api` to the API server. For a production build, run:
+Open <http://localhost:5173>. The API listens on port 3001 and Vite proxies
+`/api` to it.
+
+### Or take the whole thing with you
+
+Click **Download project .zip** in the dashboard footer, or run:
+
+```bash
+node -e "import('./server/package-download.mjs').then(async m => { const r = await m.buildProjectZip(process.cwd()); require('fs').writeFileSync('mbot-terminal.zip', r.buffer); console.log('entries', r.fileCount) })"
+```
+
+Extract it anywhere and use the included launchers: `start-windows.bat` or
+`start-mac-linux.sh`. They check for Node, create `.env` from the template, run
+`npm install` once, and start the dashboard. The archive never contains `.env`,
+`.git`, or `node_modules`.
+
+Production build:
 
 ```bash
 npm run build
 npm start
 ```
 
-Run the SMC entry-rule and Testnet safety-gate tests with `npm test`.
+---
 
-If market data is unavailable in your region, check network access to `api.binance.com`. The paper ledger is stored in this browser's local storage and does not sync across devices. Use **Reset demo wallet** to change its starting balance; this does not change exchange funds.
+## The terminal
 
-## Optional read-only account display
+Monospace, hairline borders, no gradients or blur, and no web fonts. Every
+animation is a state change rather than a decoration, so the page stays cheap to
+repaint while a one-minute candle ticks several times a second.
 
-Copy `.env.example` to `.env`. Before enabling account/AI routes, create a strong local access token, for example with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, and set it along with new keys created after rotating the exposed ones:
+Layout: top status bar, icon rail, metric row, market toolbar, then a two-column
+dashboard — chart and trade log on the left, controls, verdict, and signals on
+the right.
+
+---
+
+## The SMC engine
+
+`src/lib/smc.ts` is a self-contained analysis engine. It runs in about 1.2 ms
+for 320 candles, so it re-evaluates on the live candle rather than only on the
+close.
+
+**Structure**
+- Fractal swing points with a configurable strength filter.
+- Break of structure and change of character, drawn from confirmed pivots only —
+  a pivot is never used before `strength` bars have closed after it, so there is
+  no look-ahead.
+- Unswept buy-side and sell-side liquidity pools, clustered by relative distance,
+  with a swept/not-swept flag and touch count.
+- Sweeps with wick ratios.
+
+**Zones**
+- Order blocks found by walking back from each structural break to the last
+  opposite-coloured candle, graded A/B/C by displacement in ATR, tracked as
+  `fresh` / `tested` / `invalidated`, and invalidated by a close through them.
+- Fair value gaps from three-candle gaps, filtered by ATR size, tracked as
+  `open` / `partial` / `filled`.
+- Zones further than 8 ATR from price are dropped, because a level you cannot
+  reach is not a level you can trade.
+
+**Patterns**
+Ascending, descending and symmetrical triangles, rising and falling wedges,
+channels, ranges, and scored double tops / bottoms. Each candidate must pass a
+fit-quality threshold *and* a containment check — the fraction of bars that
+actually respected both rails — so a regression line through four arbitrary
+pivots cannot masquerade as a channel. A double top and a double bottom from the
+same window are never shown together.
+
+**Verdict**
+The engine resolves to one explicit instruction, with a score out of 100 and a
+visible checklist:
+
+| Stance | Meaning |
+| --- | --- |
+| `BUY FROM HERE` | Price is inside a fresh bullish zone with confluence, stop and targets computed. |
+| `SELL FROM HERE` | The bearish mirror. |
+| `WAIT FOR CONFIRMATION HERE` | Price is in the zone but confluence is too weak, or the zone is already mitigated. |
+| `WAIT FOR RETRACE` | The idea is valid but price has run away from the zone. |
+| `NO TRADE` | No valid zone, or structure has no direction. |
+
+A mitigated block or a partially filled gap can never produce `BUY FROM HERE` or
+`SELL FROM HERE` — at most `WAIT FOR CONFIRMATION HERE`.
+
+**Scenario path**
+A dashed projection from the zone to the nearest unswept liquidity pool and then
+the next one, with a stated confidence. It is a drawing of where liquidity
+sits, not a prediction of where price goes. The panel says so.
+
+---
+
+## Chart
+
+`lightweight-charts` renders candles and EMA 20. Everything else is drawn by
+`src/components/SmcOverlay.tsx`, a device-pixel-ratio-aware canvas layered on top
+that reads coordinates from the chart, so panning and zooming stay native.
+
+Nine independent toggles: `BOS`, `OB`, `FVG`, `LIQ`, `SWEEP`, `PAT`, `PREM`,
+`PATH`, `PLAN`, plus `EMA20`. A second row keeps the older marker layers.
+
+The overlay draws order blocks with grade and mitigation state, gaps with fill
+state, structure lines with BOS/CHoCH labels, liquidity rails with pool counts,
+sweep arrows, pattern rails with quality and target lines, the dealing range with
+premium/discount/equilibrium, the scenario path, and the verdict zone with stop
+and take-profit levels.
+
+---
+
+## Trading modes
+
+| Mode | Market data | Orders | Account |
+| --- | --- | --- | --- |
+| **Paper** | Live Binance | Simulated locally | Local wallet, editable starting balance |
+| **Testnet** | Live Binance | Manual Spot Testnet only, optional, capped, off by default | Read-only unless enabled |
+| **Live** | Live Binance | **None — no Mainnet order route exists** | Read-only balances |
+
+The Futures selector changes the paper simulation only. It does not connect to
+Binance Futures and does not model funding, liquidation, or slippage.
+
+### Paper wallet controls
+
+Entry strategy (SMC confluence, liquidity sweep, BOS/CHoCH, order-block retest,
+FVG retest, 15-minute trend confirmation, filtered momentum scalp), sizing
+strategy (fixed, martingale, anti-martingale), base order, multiplier, maximum
+order, consecutive-loss limit, risk percentage, stop-loss and take-profit
+percentage, daily stop and target, max trades per day, leverage, and trade
+cooldown. Every field is clamped in code, and the caps are listed in the UI.
+
+### Testnet orders
+
+Disabled by default. To enable:
 
 ```dotenv
-MBOT_ACCESS_TOKEN=use-a-new-random-64-character-value
-BINANCE_LIVE_API_KEY=...
-BINANCE_LIVE_SECRET_KEY=...
-BINANCE_TESTNET_API_KEY=...
-BINANCE_TESTNET_SECRET_KEY=...
-ENABLE_TESTNET_ORDERS=false
+MBOT_ACCESS_TOKEN=<64 random hex characters>
+ENABLE_TESTNET_ORDERS=true
 MBOT_TESTNET_MAX_ORDER_USDT=25
 ```
 
-To enable **manual Spot Testnet only**, set `ENABLE_TESTNET_ORDERS=true`, use a fresh Testnet key with spot trading permission, and restart the server. The per-order cap defaults to 25 USDT and is hard-limited to 50 USDT in code. A confirmation dialog is required for each order. There is no Mainnet route; Testnet orders do not attach stop-loss/take-profit orders and are not automatically managed. Enter `MBOT_ACCESS_TOKEN` in the dashboard unlock dialog to read private account data or use AI commentary. It is held in session storage for that browser tab and sent only to this app. Without the server token, private balance and paid AI routes stay locked. Do not host this prototype on a public server without additional authentication and HTTPS.
+Requires a fresh Testnet key with spot permission, a hard per-order cap of 50
+USDT that cannot be raised in code, a confirmation dialog per order, and the
+dashboard token. Orders are market orders; no stop-loss or take-profit is
+attached and nothing is managed automatically.
 
-Recommended Binance setup:
+---
 
-1. Create separate keys for dashboard read access and any future order service.
-2. Keep withdrawals disabled. Keep Mainnet permissions read-only. Only if you intentionally enable the optional Spot Testnet feature, use a separate Testnet key with spot trading permission; never reuse a Mainnet key.
-3. Restrict access with an IP allowlist when the host has a stable public IP. Never expose a private key in a web page, screenshot, chat, Git commit, or browser local storage.
-4. Select Live or Testnet in the dashboard to request balances. Testnet balance endpoints use Binance Spot Testnet or Futures Testnet as appropriate.
-5. Revoke any key you no longer need. Treat a leaked secret as permanently compromised.
+## AI panel
 
-`OPENROUTER_API_KEY` and `OPENROUTER_MODEL` are optional. The AI panel only sends the selected pair, current quote, timeframe, 15m bias, and signal labels to the configured provider; it sends no exchange credentials and cannot place trades. Rotate the key previously shared before configuring this option.
+Optional OpenRouter / DeepSeek commentary. It receives the pair, current quote,
+timeframe, bias, and signal labels. It sends no exchange credentials, cannot
+place orders, and cannot approve them. This is not MCP and it is not connected
+to the trading loop.
+
+---
+
+## Environment
+
+```dotenv
+PORT=3001
+MBOT_ACCESS_TOKEN=            # required for private routes and non-local downloads
+BINANCE_LIVE_API_KEY=         # read-only account display
+BINANCE_LIVE_SECRET_KEY=
+BINANCE_TESTNET_API_KEY=      # testnet balances, and Spot orders if enabled
+BINANCE_TESTNET_SECRET_KEY=
+ENABLE_TESTNET_ORDERS=false
+MBOT_TESTNET_MAX_ORDER_USDT=25
+OPENROUTER_API_KEY=           # optional commentary only
+OPENROUTER_MODEL=deepseek/deepseek-chat-v3-0324
+```
+
+Keys live only in the server-side `.env`, which is git-ignored. The browser
+never receives a secret key. Keep withdrawals disabled. Keep Mainnet keys
+read-only. Restrict keys by IP if the host has a stable public address.
+
+Generate a token with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+---
+
+## Tests
+
+```bash
+npm test      # 35 tests
+npm run check # TypeScript
+npm run build
+```
+
+Coverage: RSI/ATR, the scalp filter chain, all seven entry strategies, the
+triangle detector, chart layer filtering, ZIP structure and CRC correctness,
+archive secret exclusion, SMC pivots, structure look-ahead safety, FVG fill
+states, order-block grading and invalidation, liquidity clustering and sweeps,
+pattern classification, zone reachability, verdict self-consistency, and the
+Testnet safety gates.
+
+---
+
+## Layout
+
+```
+server/
+  index.mjs            Express API: market data, account reads, AI, package
+  package-download.mjs Builds the downloadable archive, excludes secrets
+  zip.mjs              Dependency-free ZIP writer
+  testnet-orders.mjs   Gated, capped Spot Testnet market orders
+src/
+  App.tsx              Dashboard
+  lib/market.ts        Indicators, entry strategies, marker generation
+  lib/smc.ts           SMC engine: structure, zones, patterns, verdict
+  components/
+    SmcOverlay.tsx     Canvas layer for every SMC drawing
+  styles.css           Terminal theme
+test/                  node:test suites
+```
+
+---
 
 ## Risk notes
 
-- Martingale sizing is bounded in the demo and the bot pauses at configured safety limits, but a cap does not remove the strategy's tail risk. A losing streak can exhaust available capital; a sequence of losses cannot be prevented by AI or a confirmation rule.
-- A target such as 25% every day is not a realistic or guaranteed expectation. Fees, spread, slippage, latency, and market regime can make short-timeframe systems unprofitable.
-- A low unit price (for example, SHIB) does not make a trade cheaper in percentage terms. Exchange minimum notional, quantity step size, fees, and quote-currency balance determine whether an order is possible.
-- Do not use money you cannot afford to lose. Paper results do not establish live profitability.
+- **Martingale is the main way people lose everything.** After five losses a 3×
+  multiplier has already committed 121× the base stake. The caps here bound it;
+  the tail risk is unchanged.
+- **One-minute entries are expensive.** Round-trip fees and spread consume a
+  large share of a small target, and most apparent edge disappears after costs.
+- **A cheap coin is not a cheap trade.** SHIB at $0.00001 is the same percentage
+  move as BTC at $60,000. Unit price changes nothing. What matters is the
+  exchange minimum notional, the quantity step size, and your quote balance.
+- **Paper results are not live results.** Simulation has no partial fills,
+  latency, rejection, disconnection, or liquidation.
+- **This app cannot lose your Binance money** because it has no route to place a
+  Mainnet order. Keep it that way until you have independently verified a
+  strategy over a long period on Testnet and at real size.
+- Do not trade money you cannot afford to lose.
